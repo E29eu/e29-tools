@@ -82,7 +82,8 @@
         Show-SyncInfo $null
         return
     }
-    Say OK "New e29-core $($core.version) is installed."
+    if ((Get-Major $core.version) -ge 2) { Say OK "New e29-core $($core.version) is installed." }
+    else { Say TODO "New e29-core is here but old ($($core.version)); it must be 2 or higher - see the end." }
 
     # 2. Old e29-core from the GitHub marketplace, at every scope.
     foreach ($old in @($plugins | Where-Object { $_.id -eq 'e29-core@e29-core' })) {
