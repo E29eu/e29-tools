@@ -1,0 +1,142 @@
+& {
+    # E29 plugin one-time cleanup. Safe to run again. Run in PowerShell:
+    #   irm https://raw.githubusercontent.com/E29eu/e29-tools/main/e29-cleanup.ps1 | iex
+    $ErrorActionPreference = 'Continue'
+    $state = @{ Fail = 0; Todo = 0 }
+    # Claude Code resolves ~ to %USERPROFILE%; 5.1's $HOME differs on a redirected profile.
+    $userHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+    $cfg = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { "$userHome\.claude" }
+
+    function Say($tag, $msg) {
+        $color = @{ OK = 'Green'; FIXED = 'Green'; SKIP = 'Gray'; TODO = 'Yellow'; FAIL = 'Red' }[$tag]
+        if ($tag -eq 'FAIL') { $state.Fail++ }
+        if ($tag -eq 'TODO') { $state.Todo++ }
+        Write-Host ('[{0}] {1}' -f $tag, $msg) -ForegroundColor $color
+    }
+    function Invoke-Claude {
+        $out = (& $claude @args 2>&1 | ForEach-Object { "$_" }) -join ' '
+        @{ Ok = ($LASTEXITCODE -eq 0); Out = $out }
+    }
+    function Get-ClaudeJson {
+        $text = (& $claude @args 2>$null) -join "`n"
+        $match = [regex]::Match("$text", '(?s)\[.*\]')
+        if (-not $match.Success) { return $null }
+        $parsed = $match.Value | ConvertFrom-Json
+        return , @($parsed)
+    }
+    function Get-Major($version) { $major = 0; [void][int]::TryParse("$version".Split('.')[0], [ref]$major); $major }
+
+    Write-Host "`nE29 plugin cleanup`n" -ForegroundColor White
+
+    # Claude Code CLI on PATH, else the copy Claude Desktop or VS Code ships.
+    $claude = @(Get-Command claude -CommandType Application -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in '.exe', '.cmd' } | ForEach-Object { $_.Source })
+    $claude += @("$userHome\.local\bin\claude.exe") | Where-Object { Test-Path $_ }
+    $claude += @(Get-ChildItem "$env:APPDATA\Claude\claude-code", "$env:LOCALAPPDATA\Packages\Claude_*\LocalCache\Roaming\Claude\claude-code", "$userHome\.vscode\extensions\anthropic.claude-code-*\resources\native-binary" -Recurse -Filter claude.exe -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | ForEach-Object { $_.FullName })
+    $claude = $claude | Select-Object -First 1
+    if (-not $claude) {
+        Say FAIL 'Claude is not installed on this computer. Install Claude Desktop or Claude Code, sign in with your E29 claude.ai account, then paste this again.'
+        return
+    }
+
+    while ($running = @(Get-Process -Name claude -ErrorAction SilentlyContinue)) {
+        Write-Host 'Claude is still running. Quit Claude Desktop (also right-click its tray icon next to the clock and choose Quit) and close every Claude Code window, including inside VS Code.' -ForegroundColor Yellow
+        if ((Read-Host 'Press Enter to check again, or type C and Enter to continue anyway') -eq 'C') { break }
+    }
+
+    $plugins = Get-ClaudeJson plugin list --json
+    if ($null -eq $plugins) {
+        Say FAIL "Could not read the plugin list. Run this to see why:  & '$claude' plugin list"
+        return
+    }
+
+    # 1. The new e29-core comes from the claude.ai organisation. Nothing is removed until it is here.
+    $core = $plugins | Where-Object { $_.id -eq 'e29-core@synced' } | Select-Object -First 1
+    if (-not $core) {
+        Say FAIL 'The new e29-core is not on this computer yet. Nothing was changed.'
+        Write-Host '       Open Claude Code, type /login, sign in with your E29 claude.ai account, quit Claude, then paste this again.'
+        return
+    }
+    Say OK "New e29-core $($core.version) is installed."
+
+    # 2. Old e29-core from the GitHub marketplace, at every scope.
+    foreach ($old in @($plugins | Where-Object { $_.id -eq 'e29-core@e29-core' })) {
+        $folder = if ($old.scope -eq 'user') { $userHome } else { $old.projectPath }
+        if (-not $folder -or -not (Test-Path $folder)) { Say SKIP "Old e29-core entry for a folder that no longer exists: $($old.projectPath)"; continue }
+        Push-Location $folder
+        $run = Invoke-Claude plugin uninstall e29-core@e29-core --scope $old.scope
+        Pop-Location
+        if (-not $run.Ok) { Say FAIL "Could not remove old e29-core ($($old.scope) scope): $($run.Out)"; continue }
+        Say FIXED "Removed old e29-core $($old.version) ($($old.scope) scope)."
+        if ($old.scope -eq 'project') { Write-Host "       This changed $folder\.claude\settings.json: commit that change." }
+    }
+
+    $markets = Get-ClaudeJson plugin marketplace list --json
+    if (@($markets | Where-Object { $_.name -eq 'e29-core' }).Count) {
+        $run = Invoke-Claude plugin marketplace remove e29-core
+        if ($run.Ok) { Say FIXED 'Removed the old e29-core marketplace.' } else { Say FAIL "Could not remove the old e29-core marketplace: $($run.Out)" }
+    }
+
+    # 3. e29-pm stays a GitHub marketplace plugin: update it and make sure it is on.
+    $pm = @($plugins | Where-Object { $_.id -eq 'e29-pm@e29-pm' })
+    if (-not $pm.Count) {
+        Say SKIP 'e29-pm is not installed (only the project-management team needs it).'
+    }
+    else {
+        [void](Invoke-Claude plugin marketplace update e29-pm)
+        $run = Invoke-Claude plugin update e29-pm@e29-pm
+        if (-not $run.Ok) {
+            Say FAIL "Could not update e29-pm: $($run.Out)"
+            Write-Host '       Usually GitHub sign-in: run  gh auth login --web  then paste this again.'
+        }
+        # ponytail: only user-scope e29-pm is re-enabled; project-scope installs are the repo owner's choice.
+        if (@($pm | Where-Object { $_.scope -eq 'user' -and -not $_.enabled }).Count) {
+            $run = Invoke-Claude plugin enable e29-pm@e29-pm --scope user
+            if ($run.Ok) { Say FIXED 'Turned e29-pm back on.' } else { Say FAIL "Could not turn e29-pm on: $($run.Out)" }
+        }
+    }
+
+    # 4. The setup check: Claude Desktop config, dependencies, Dataverse connection.
+    $setup = Join-Path "$($core.installPath)" 'skills\setup-e29-plugin\scripts\setup_e29_plugin.ps1'
+    if (Test-Path $setup) {
+        Write-Host "`n--- E29 setup check ---" -ForegroundColor White
+        # Transcript keeps setup's colours on screen and lets us count its "still to do" lines.
+        $env:E29_SETUP = $setup
+        $env:E29_LOG = Join-Path $env:TEMP 'e29-setup-check.log'
+        & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command 'Start-Transcript -LiteralPath $env:E29_LOG -Force | Out-Null; & $env:E29_SETUP; $code = $LASTEXITCODE; Stop-Transcript | Out-Null; exit $code'
+        if ($LASTEXITCODE) { Say FAIL 'The setup check above found a problem: read the red lines.' }
+        $state.Todo += @(Get-Content -LiteralPath $env:E29_LOG -Encoding UTF8 -ErrorAction SilentlyContinue |
+                Where-Object { $_.StartsWith([string][char]0x23F3) -or $_.StartsWith('[TODO]') }).Count
+        Write-Host "--- end of setup check ---`n" -ForegroundColor White
+    }
+    else { Say TODO "Setup check not found in the new e29-core; in Claude Code run /e29-core:setup-e29-plugin" }
+
+    # 5. Final check, read back from Claude itself.
+    $plugins = Get-ClaudeJson plugin list --json
+    $core = $plugins | Where-Object { $_.id -eq 'e29-core@synced' } | Select-Object -First 1
+    if ($core -and $core.enabled -and (Get-Major $core.version) -ge 2) { Say OK "e29-core $($core.version) from claude.ai is installed and on." }
+    else { Say FAIL "e29-core from claude.ai is $(if ($core) { "version $($core.version), on=$($core.enabled)" } else { 'missing' }); expected version 2 or higher. Start Claude once, quit it, paste this again." }
+
+    $left = @($plugins | Where-Object { $_.id -eq 'e29-core@e29-core' -and ($_.scope -eq 'user' -or ($_.projectPath -and (Test-Path $_.projectPath))) })
+    $markets = Get-ClaudeJson plugin marketplace list --json
+    if ($left.Count -or @($markets | Where-Object { $_.name -eq 'e29-core' }).Count) { Say FAIL 'The old e29-core is still installed (see the red lines above).' }
+    else {
+        Say OK 'The old e29-core is gone.'
+        foreach ($dir in "$cfg\plugins\cache\e29-core", "$cfg\plugins\marketplaces\e29-core") {
+            if (-not (Test-Path $dir)) { continue }
+            Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path $dir) { Say TODO "Could not delete leftover folder $dir (a file is in use). Restart Windows and paste this again." }
+            else { Say FIXED "Deleted leftover folder $dir" }
+        }
+    }
+
+    foreach ($p in @($plugins | Where-Object { $_.id -eq 'e29-pm@e29-pm' -and $_.scope -eq 'user' })) {
+        if ($p.enabled -and (Get-Major $p.version) -ge 2) { Say OK "e29-pm $($p.version) is installed and on." }
+        else { Say FAIL "e29-pm is version $($p.version), on=$($p.enabled); expected version 2 or higher and on." }
+    }
+
+    if ($state.Fail) { Write-Host "`n$($state.Fail) problem(s) above. Send a screenshot of this window to Attila." -ForegroundColor Red }
+    elseif ($state.Todo) { Write-Host "`nAlmost done: $($state.Todo) thing(s) still to do - read the yellow lines above, then start Claude again." -ForegroundColor Yellow }
+    else { Write-Host "`nAll done. Start Claude again." -ForegroundColor Green }
+}
