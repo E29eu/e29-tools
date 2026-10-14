@@ -82,8 +82,25 @@
         Show-SyncInfo $null
         return
     }
-    if ((Get-Major $core.version) -ge 2) { Say OK "New e29-core $($core.version) is installed." }
-    else { Say TODO "New e29-core is here but old ($($core.version)); it must be 2 or higher - see the end." }
+    # Old copy: a failed download can leave .staging behind and stall every later sync. A headless
+    # run triggers a sync; if that is not enough, the synced folder (a cache of claude.ai) is rebuilt.
+    $oldVersion = $core.version
+    $bucket = Split-Path "$($core.installPath)"
+    foreach ($reset in '.staging', 'all') {
+        if ((Get-Major $core.version) -ge 2) { break }
+        Write-Host "       e29-core $($core.version) is old; downloading the new version from claude.ai..." -ForegroundColor Yellow
+        if ((Split-Path $bucket) -ne "$cfg\plugins\synced") { break }
+        $target = if ($reset -eq 'all') { $bucket } else { Join-Path $bucket '.staging' }
+        Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
+        Push-Location $userHome
+        [void](Invoke-Claude -p 'Reply with OK.' --max-turns 1)
+        Pop-Location
+        $plugins = Get-ClaudeJson plugin list --json
+        $core = $plugins | Where-Object { $_.id -eq 'e29-core@synced' } | Select-Object -First 1
+    }
+    if ((Get-Major $core.version) -lt 2) { Say TODO "New e29-core is old ($(if ($core) { $core.version } else { 'missing' })); it must be 2 or higher - see the end." }
+    elseif ($core.version -ne $oldVersion) { Say FIXED "Downloaded e29-core $($core.version) (was $oldVersion)." }
+    else { Say OK "New e29-core $($core.version) is installed." }
 
     # 2. Old e29-core from the GitHub marketplace, at every scope.
     foreach ($old in @($plugins | Where-Object { $_.id -eq 'e29-core@e29-core' })) {
@@ -144,8 +161,7 @@
     elseif ($core -and -not $core.enabled) { Say FAIL 'e29-core from claude.ai is turned off. In Claude Code type /plugin, turn e29-core on, then run this again.' }
     else {
         Say FAIL "e29-core from claude.ai is $(if ($core) { "version $($core.version)" } else { 'missing' }); it must be 2 or higher."
-        Write-Host '       Claude downloads the new version when it starts: type  claude  here, press Enter,'
-        Write-Host '       wait for the prompt, type /exit, then run this again.'
+        Write-Host '       Downloading it from claude.ai did not work on this computer.'
         Show-SyncInfo $core
     }
 
