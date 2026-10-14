@@ -116,7 +116,12 @@
     $plugins = Get-ClaudeJson plugin list --json
     $core = $plugins | Where-Object { $_.id -eq 'e29-core@synced' } | Select-Object -First 1
     if ($core -and $core.enabled -and (Get-Major $core.version) -ge 2) { Say OK "e29-core $($core.version) from claude.ai is installed and on." }
-    else { Say FAIL "e29-core from claude.ai is $(if ($core) { "version $($core.version), on=$($core.enabled)" } else { 'missing' }); expected version 2 or higher. Start Claude once, quit it, paste this again." }
+    elseif ($core -and -not $core.enabled) { Say FAIL 'e29-core from claude.ai is turned off. In Claude Code type /plugin, turn e29-core on, then run this again.' }
+    else {
+        Say FAIL "e29-core from claude.ai is $(if ($core) { "version $($core.version)" } else { 'missing' }); it must be 2 or higher."
+        Write-Host '       Claude downloads the new version when it starts: type  claude  here, press Enter,'
+        Write-Host '       wait for the prompt, type /exit, then run this again.'
+    }
 
     $left = @($plugins | Where-Object { $_.id -eq 'e29-core@e29-core' -and ($_.scope -eq 'user' -or ($_.projectPath -and (Test-Path $_.projectPath))) })
     $markets = Get-ClaudeJson plugin marketplace list --json
