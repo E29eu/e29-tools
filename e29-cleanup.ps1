@@ -25,6 +25,29 @@
         return , @($parsed)
     }
     function Get-Major($version) { $major = 0; [void][int]::TryParse("$version".Split('.')[0], [ref]$major); $major }
+    # Why the claude.ai copy on disk is old or missing: sign-in, and what the last sync wrote.
+    function Show-SyncInfo($core) {
+        $lines = @("claude $((& $claude --version 2>$null) -join ' ')")
+        $auth = (& $claude auth status 2>$null) -join "`n"
+        try { $a = $auth | ConvertFrom-Json; $lines += "signed in: $($a.loggedIn) via $($a.authMethod) as $($a.email), org $($a.orgName) $($a.orgId)" }
+        catch { $lines += "auth status: $auth" }
+        if ($core) { $lines += "loaded from: $($core.installPath)" }
+        foreach ($bucket in @(Get-ChildItem "$cfg\plugins\synced" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '.*' })) {
+            $lines += "folder $($bucket.Name)"
+            try {
+                $m = Get-Content -LiteralPath "$($bucket.FullName)\manifest.json" -Raw | ConvertFrom-Json
+                $lines += "  last sync $([DateTimeOffset]::FromUnixTimeMilliseconds([long]$m.lastUpdated).LocalDateTime)"
+                foreach ($p in @($m.plugins | Where-Object { $_.name -eq 'e29-core' })) { $lines += "  claude.ai says e29-core generation $($p.generation), updated $($p.updatedAt)" }
+            }
+            catch { $lines += '  no readable manifest.json' }
+            foreach ($dir in @(Get-ChildItem -LiteralPath $bucket.FullName -Directory -Force | Where-Object { $_.Name -like 'e29-core*' -or $_.Name -eq '.staging' })) {
+                $version = try { (Get-Content -LiteralPath "$($dir.FullName)\.claude-plugin\plugin.json" -Raw -ErrorAction Stop | ConvertFrom-Json).version } catch { '-' }
+                $lines += "  $($dir.Name)  v$version  $($dir.LastWriteTime)  ($(@(Get-ChildItem -LiteralPath $dir.FullName -Force).Count) items)"
+            }
+        }
+        Write-Host '       Details for Attila:' -ForegroundColor Gray
+        $lines | ForEach-Object { Write-Host "         $_" -ForegroundColor Gray }
+    }
 
     Write-Host "`nE29 plugin cleanup`n" -ForegroundColor White
 
@@ -56,6 +79,7 @@
     if (-not $core) {
         Say FAIL 'The new e29-core is not on this computer yet. Nothing was changed.'
         Write-Host '       Open Claude Code, type /login, sign in with your E29 claude.ai account, quit Claude, then paste this again.'
+        Show-SyncInfo $null
         return
     }
     Say OK "New e29-core $($core.version) is installed."
@@ -121,6 +145,7 @@
         Say FAIL "e29-core from claude.ai is $(if ($core) { "version $($core.version)" } else { 'missing' }); it must be 2 or higher."
         Write-Host '       Claude downloads the new version when it starts: type  claude  here, press Enter,'
         Write-Host '       wait for the prompt, type /exit, then run this again.'
+        Show-SyncInfo $core
     }
 
     $left = @($plugins | Where-Object { $_.id -eq 'e29-core@e29-core' -and ($_.scope -eq 'user' -or ($_.projectPath -and (Test-Path $_.projectPath))) })
