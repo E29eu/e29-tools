@@ -25,20 +25,29 @@
         return , @($parsed)
     }
     function Get-Major($version) { $major = 0; [void][int]::TryParse("$version".Split('.')[0], [ref]$major); $major }
+    # Claude Code skips the claude.ai plugin sync when the sign-in lacks the user:plugins scope
+    # (sign-ins from older versions). Reads only the scope list, never a token. $null = unknown.
+    function Get-PluginScope {
+        try { $text = [IO.File]::ReadAllText("$cfg\.credentials.json") } catch { return $null }
+        $match = [regex]::Match($text, '"claudeAiOauth"\s*:\s*\{[^{}]*?"scopes"\s*:\s*\[([^\]]*)\]')
+        if (-not $match.Success) { return $null }
+        $match.Groups[1].Value.Contains('"user:plugins"')
+    }
     # Why the claude.ai copy on disk is old or missing: sign-in, and what the last sync wrote.
     function Show-SyncInfo($core) {
         $lines = @("claude $((& $claude --version 2>$null) -join ' ')")
         $auth = (& $claude auth status 2>$null) -join "`n"
         try { $a = $auth | ConvertFrom-Json; $lines += "signed in: $($a.loggedIn) via $($a.authMethod) as $($a.email), org $($a.orgName) $($a.orgId)" }
         catch { $lines += "auth status: $auth" }
+        $lines += "sign-in allows plugin sync (user:plugins): $(if ($null -eq ($scope = Get-PluginScope)) { 'unknown' } else { $scope })"
         if ($core) { $lines += "loaded from: $($core.installPath)" }
         $buckets = @(Get-ChildItem "$cfg\plugins\synced" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '.*' })
         if (-not $buckets.Count) { $lines += "no synced folder in $cfg\plugins\synced - this Claude Code never synced from claude.ai" }
         foreach ($bucket in $buckets) {
             $lines += "folder $($bucket.Name)"
             try {
-                $m = Get-Content -LiteralPath "$($bucket.FullName)\manifest.json" -Raw | ConvertFrom-Json
-                $lines += "  last sync $([DateTimeOffset]::FromUnixTimeMilliseconds([long]$m.lastUpdated).LocalDateTime)"
+                $m = Get-Content -LiteralPath "$($bucket.FullName)\manifest.json" -Raw -ErrorAction Stop | ConvertFrom-Json
+                $lines += "  last sync $(if ($m.lastUpdated) { [DateTimeOffset]::FromUnixTimeMilliseconds([long]$m.lastUpdated).LocalDateTime } else { 'never' })"
                 foreach ($p in @($m.plugins | Where-Object { $_.name -eq 'e29-core' })) { $lines += "  claude.ai says e29-core generation $($p.generation), updated $($p.updatedAt)" }
             }
             catch { $lines += '  no readable manifest.json' }
@@ -90,6 +99,13 @@
             [void](Invoke-Claude update)
             $after = (& $claude --version 2>$null) -join ' '
             if ($after -ne $before) { Say FIXED "Updated Claude Code: $before -> $after" }
+            if ((Get-PluginScope) -eq $false) {
+                Write-Host '       Your Claude sign-in is too old to download plugins. A browser opens now:' -ForegroundColor Yellow
+                Write-Host '       sign in with your E29 claude.ai account, then come back to this window.' -ForegroundColor Yellow
+                & $claude auth login --claudeai
+                if (Get-PluginScope) { Say FIXED 'Signed in to Claude again; plugin download allowed.' }
+                else { Say FAIL 'The new Claude sign-in still does not allow plugin download.' }
+            }
         }
         elseif ($core -and (Split-Path (Split-Path "$($core.installPath)")) -eq "$cfg\plugins\synced") {
             $bucket = Split-Path "$($core.installPath)"
