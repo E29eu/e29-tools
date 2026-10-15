@@ -32,7 +32,9 @@
         try { $a = $auth | ConvertFrom-Json; $lines += "signed in: $($a.loggedIn) via $($a.authMethod) as $($a.email), org $($a.orgName) $($a.orgId)" }
         catch { $lines += "auth status: $auth" }
         if ($core) { $lines += "loaded from: $($core.installPath)" }
-        foreach ($bucket in @(Get-ChildItem "$cfg\plugins\synced" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '.*' })) {
+        $buckets = @(Get-ChildItem "$cfg\plugins\synced" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '.*' })
+        if (-not $buckets.Count) { $lines += "no synced folder in $cfg\plugins\synced - this Claude Code never synced from claude.ai" }
+        foreach ($bucket in $buckets) {
             $lines += "folder $($bucket.Name)"
             try {
                 $m = Get-Content -LiteralPath "$($bucket.FullName)\manifest.json" -Raw | ConvertFrom-Json
@@ -76,29 +78,36 @@
 
     # 1. The new e29-core comes from the claude.ai organisation. Nothing is removed until it is here.
     $core = $plugins | Where-Object { $_.id -eq 'e29-core@synced' } | Select-Object -First 1
-    if (-not $core) {
-        Say FAIL 'The new e29-core is not on this computer yet. Nothing was changed.'
-        Write-Host '       Open Claude Code, type /login, sign in with your E29 claude.ai account, quit Claude, then paste this again.'
-        Show-SyncInfo $null
-        return
-    }
-    # Old copy: a failed download can leave .staging behind and stall every later sync. A headless
-    # run triggers a sync; if that is not enough, the synced folder (a cache of claude.ai) is rebuilt.
-    $oldVersion = $core.version
-    $bucket = Split-Path "$($core.installPath)"
-    foreach ($reset in '.staging', 'all') {
+    # Missing or old: an old Claude Code does not sync claude.ai plugins at all, so update it first;
+    # a headless run then triggers a sync. A failed download can leave .staging behind and stall
+    # every later sync, so that goes next, then the whole synced folder (a cache of claude.ai).
+    $oldVersion = if ($core) { $core.version } else { 'missing' }
+    foreach ($reset in 'update', '.staging', 'all') {
         if ((Get-Major $core.version) -ge 2) { break }
-        Write-Host "       e29-core $($core.version) is old; downloading the new version from claude.ai..." -ForegroundColor Yellow
-        if ((Split-Path $bucket) -ne "$cfg\plugins\synced") { break }
-        $target = if ($reset -eq 'all') { $bucket } else { Join-Path $bucket '.staging' }
-        Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
+        if ($reset -eq 'update') {
+            Write-Host "       e29-core is $(if ($core) { "old ($($core.version))" } else { 'missing' }); getting the current version from claude.ai..." -ForegroundColor Yellow
+            $before = (& $claude --version 2>$null) -join ' '
+            [void](Invoke-Claude update)
+            $after = (& $claude --version 2>$null) -join ' '
+            if ($after -ne $before) { Say FIXED "Updated Claude Code: $before -> $after" }
+        }
+        elseif ($core -and (Split-Path (Split-Path "$($core.installPath)")) -eq "$cfg\plugins\synced") {
+            $bucket = Split-Path "$($core.installPath)"
+            Remove-Item -LiteralPath $(if ($reset -eq 'all') { $bucket } else { Join-Path $bucket '.staging' }) -Recurse -Force -ErrorAction SilentlyContinue
+        }
         Push-Location $userHome
         [void](Invoke-Claude -p 'Reply with OK.' --max-turns 1)
         Pop-Location
         $plugins = Get-ClaudeJson plugin list --json
         $core = $plugins | Where-Object { $_.id -eq 'e29-core@synced' } | Select-Object -First 1
     }
-    if ((Get-Major $core.version) -lt 2) { Say TODO "New e29-core is old ($(if ($core) { $core.version } else { 'missing' })); it must be 2 or higher - see the end." }
+    if (-not $core) {
+        Say FAIL 'The new e29-core is not on this computer yet. Nothing was changed.'
+        Write-Host '       Getting it from claude.ai did not work. Not signed in? Type  claude , then /login with your E29 claude.ai account.'
+        Show-SyncInfo $null
+        return
+    }
+    if ((Get-Major $core.version) -lt 2) { Say TODO "New e29-core is old ($($core.version)); it must be 2 or higher - see the end." }
     elseif ($core.version -ne $oldVersion) { Say FIXED "Downloaded e29-core $($core.version) (was $oldVersion)." }
     else { Say OK "New e29-core $($core.version) is installed." }
 
