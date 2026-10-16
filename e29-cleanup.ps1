@@ -86,7 +86,8 @@
             try {
                 $m = Get-Content -LiteralPath "$($bucket.FullName)\manifest.json" -Raw -ErrorAction Stop | ConvertFrom-Json
                 $lines += "  last sync $(if ($m.lastUpdated) { [DateTimeOffset]::FromUnixTimeMilliseconds([long]$m.lastUpdated).LocalDateTime } else { 'never' })"
-                foreach ($p in @($m.plugins | Where-Object { $_.name -eq 'e29-core' })) { $lines += "  claude.ai says e29-core generation $($p.generation), updated $($p.updatedAt)" }
+                foreach ($p in @($m.plugins | Where-Object { $_.name -eq 'e29-core' })) { $lines += "  claude.ai sends e29-core $($p.pluginId) from $($p.marketplaceName) ($($p.installationPreference)), generation $($p.generation), updated $($p.updatedAt)" }
+                foreach ($r in @((Get-Content -LiteralPath "$($bucket.FullName)\.marketplaces.json" -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json).rows)) { if ($r) { $lines += "  marketplace $($r.name) ($($r.scope)), updated $($r.updated_at)" } }
             }
             catch { $lines += '  no readable manifest.json' }
             foreach ($dir in @(Get-ChildItem -LiteralPath $bucket.FullName -Directory -Force | Where-Object { $_.Name -like 'e29-core*' -or $_.Name -eq '.staging' })) {
