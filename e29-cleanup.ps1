@@ -8,6 +8,7 @@
     $cfg = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { "$userHome\.claude" }
     # The E29 claude.ai organisation; synced folder names start with it.
     $e29OrgId = '1119948f-586d-43b6-88e5-a2431fa8ae84'
+    $e29Marketplace = 'E29eu/claude-e29-core-plugin'
     $syncWaitSeconds = 120
 
     function Say($tag, $msg) {
@@ -39,6 +40,12 @@
         $long = if ($full.StartsWith('\\')) { '\\?\UNC\' + $full.Substring(2) } else { '\\?\' + $full }
         cmd /c rd /s /q $long 2>&1 | Out-Null
         -not (Test-Path -LiteralPath $path)
+    }
+    # A personal upload named e29-core (claude.ai "My Uploads") is synced in place of the E29 one.
+    function Get-UploadedCore {
+        foreach ($m in @(Get-ChildItem "$cfg\plugins\synced\*\manifest.json" -Force -ErrorAction SilentlyContinue)) {
+            try { (Get-Content -LiteralPath $m.FullName -Raw | ConvertFrom-Json).plugins | Where-Object { $_.name -eq 'e29-core' -and $_.marketplaceName -ne $e29Marketplace } } catch { }
+        }
     }
     # Changes each time a claude.ai sync round finishes.
     function Get-SyncRound { (Get-ChildItem "$cfg\plugins\synced\*\.last-complete-round" -Force -ErrorAction SilentlyContinue | Get-Content -Raw -ErrorAction SilentlyContinue) -join ',' }
@@ -133,7 +140,8 @@
     # so that goes next, then the whole synced folder (a cache of claude.ai).
     $oldVersion = if ($core) { $core.version } else { 'missing' }
     foreach ($reset in 'update', '.staging', 'all') {
-        if ((Get-Major $core.version) -ge 2) { break }
+        # No reset helps against an own upload: claude.ai sends it again.
+        if ((Get-Major $core.version) -ge 2 -or (Get-UploadedCore)) { break }
         if ($reset -eq 'update') {
             Write-Host "       e29-core is $(if ($core) { "old ($($core.version))" } else { 'missing' }); getting the current version from claude.ai..." -ForegroundColor Yellow
             $before = (& $claude --version 2>$null) -join ' '
@@ -165,13 +173,18 @@
     }
     $plugins = Get-ClaudeJson plugin list --json
     $core = $plugins | Where-Object { $_.id -eq 'e29-core@synced' } | Select-Object -First 1
+    if ((Get-Major $core.version) -lt 2 -and ($uploaded = @(Get-UploadedCore)[0])) {
+        Say TODO "Your claude.ai account has its own old copy of e29-core (in My Uploads, from $($uploaded.updatedAt)). It hides the E29 one."
+        Write-Host '       In claude.ai open Customize > Plugins, delete e29-core under My Uploads, then paste this again.' -ForegroundColor Yellow
+    }
     if (-not $core) {
         Say FAIL 'The new e29-core is not on this computer yet. Nothing was changed.'
         Write-Host '       Getting it from claude.ai did not work. Not signed in? Type  claude , then /login with your E29 claude.ai account.'
         Show-SyncInfo $null
         return
     }
-    if ((Get-Major $core.version) -lt 2) { Say TODO "New e29-core is old ($($core.version)); it must be 2 or higher - see the end." }
+    if ($uploaded) { }
+    elseif ((Get-Major $core.version) -lt 2) { Say TODO "New e29-core is old ($($core.version)); it must be 2 or higher - see the end." }
     elseif ($core.version -ne $oldVersion) { Say FIXED "Downloaded e29-core $($core.version) (was $oldVersion)." }
     else { Say OK "New e29-core $($core.version) is installed." }
 
@@ -233,6 +246,7 @@
     $plugins = Get-ClaudeJson plugin list --json
     $core = $plugins | Where-Object { $_.id -eq 'e29-core@synced' } | Select-Object -First 1
     if ($core -and $core.enabled -and (Get-Major $core.version) -ge 2) { Say OK "e29-core $($core.version) from claude.ai is installed and on." }
+    elseif ($uploaded) { Write-Host '       e29-core stays old until the My Uploads copy is deleted (see above).' -ForegroundColor Yellow }
     elseif ($core -and -not $core.enabled) { Say FAIL 'e29-core from claude.ai is turned off. In Claude Code type /plugin, turn e29-core on, then run this again.' }
     else {
         Say FAIL "e29-core from claude.ai is $(if ($core) { "version $($core.version)" } else { 'missing' }); it must be 2 or higher."
