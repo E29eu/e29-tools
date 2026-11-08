@@ -564,7 +564,7 @@ param([switch] $Check, [switch] $MachineOnly)
     Section 'Still to do by hand (once per computer)'
     $left = @(
         "Claude Desktop: Settings > Connectors > Microsoft 365 > Connect, sign in with your E29 Microsoft account. Guide: $kb/getting-started/set-up-your-computer/#connect-microsoft-365",
-        "Synology Drive Client: connect to the E29 NAS and sign in. Guide: $kb/getting-started/systems-and-accounts/",
+        "Photo and video staff only - Synology Drive Client: sync your NAS folders. Guide: $kb/how-to-set-up-tools/synology-drive-sync/",
         "Bitwarden app and browser extension: server https://vault.e29.eu/ then sign in. Guide: $kb/getting-started/set-up-your-computer/#set-up-bitwarden"
     )
     if ($pm) { $left += "Project management keys (Odoo, Fio, EU Login) into keyring: https://github.com/$pmRepo#readme" }
