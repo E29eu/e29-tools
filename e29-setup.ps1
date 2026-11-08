@@ -1,6 +1,7 @@
 param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant)
 & {
-    # E29 staff computer setup: apps, Claude with the E29 plugins, GitHub sign-in and git identity.
+    # E29 staff computer setup: apps, Claude with the E29 plugins, GitHub sign-in and git identity,
+    # plus a device inventory and posture lines in the log.
     # Safe to run again: it checks first, changes only what is missing, then verifies. In PowerShell:
     #   irm https://raw.githubusercontent.com/E29eu/e29-tools/main/e29-setup.ps1 | iex
     # Check only, changes nothing:
@@ -328,6 +329,79 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
         return
     }
     Say OK "Windows $([Environment]::OSVersion.Version.Build), winget $((winget --version) -join '')."
+
+    # Inventory, for the log Attila reconciles with the Assets table (serial number), Entra and
+    # Intune (device name, device id, MAC addresses). Reads only, no admin rights needed.
+    function Get-Safe($block) { try { & $block } catch { } }
+    $cs = Get-Safe { Get-CimInstance Win32_ComputerSystem -ErrorAction Stop }
+    $bios = Get-Safe { Get-CimInstance Win32_BIOS -ErrorAction Stop }
+    $cpu = Get-Safe { Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1 }
+    $os = Get-Safe { Get-CimInstance Win32_OperatingSystem -ErrorAction Stop }
+    $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+    $memory = (Get-Safe { Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop } | Measure-Object Capacity -Sum).Sum
+    Note "Device: $env:COMPUTERNAME"
+    Note "Model: $($cs.Manufacturer) $($cs.Model)"
+    Note "Serial number: $("$($bios.SerialNumber)".Trim())"
+    Note "BIOS: $($bios.SMBIOSBIOSVersion)$(if ($bios.ReleaseDate) { ", $($bios.ReleaseDate.ToString('yyyy-MM-dd'))" })"
+    Note ('CPU: {0}, {1} cores' -f "$($cpu.Name)".Trim(), $cpu.NumberOfCores)
+    Note ('Memory: {0:N0} GB' -f ($memory / 1GB))
+    foreach ($disk in @(Get-Safe { Get-PhysicalDisk -ErrorAction Stop })) { Note ('Disk: {0}, {1:N0} GB {2} {3}, {4}' -f $disk.FriendlyName, ($disk.Size / 1GB), $disk.MediaType, $disk.BusType, $disk.HealthStatus) }
+    # Design capacity needs admin rights in WMI; the battery report does not.
+    if (Get-Safe { Get-CimInstance Win32_Battery -ErrorAction Stop }) {
+        $report = Join-Path $env:TEMP "e29-battery-$PID.xml"
+        $null = powercfg /batteryreport /xml /output $report 2>&1
+        foreach ($b in @(Get-Safe { ([xml](Get-Content -LiteralPath $report -Raw -ErrorAction Stop)).BatteryReport.Batteries.Battery })) {
+            if ([double]$b.DesignCapacity -gt 0) { Note ('Battery: {0:N0} of {1:N0} mWh design ({2:P0}), {3} cycles' -f [double]$b.FullChargeCapacity, [double]$b.DesignCapacity, ([double]$b.FullChargeCapacity / [double]$b.DesignCapacity), $b.CycleCount) }
+        }
+        Remove-Item -LiteralPath $report -Force -ErrorAction SilentlyContinue
+    }
+    Note "Windows: $($os.Caption) $($cv.DisplayVersion), build $($cv.CurrentBuild).$($cv.UBR), $($os.OSArchitecture)$(if ($os.InstallDate) { ", installed $($os.InstallDate.ToString('yyyy-MM-dd'))" })$(if ($os.LastBootUpTime) { ", started $($os.LastBootUpTime.ToString('yyyy-MM-dd'))" })"
+    # Entra device id: joined, or registered to the E29 tenant (a work account added in Settings).
+    $dsreg = (dsregcmd /status 2>$null) -join "`n"
+    $registered = @([regex]::Matches($dsreg, 'WorkplaceDeviceId : (\S+)[\s\S]*?WorkplaceTenantId : (\S+)') | Where-Object { $_.Groups[2].Value -eq $tenantId })
+    if ($dsreg -match 'AzureAdJoined : YES' -and $dsreg -match '\bDeviceId : (\S+)') { Note "Entra: joined, device id $($Matches[1])" }
+    elseif ($registered.Count) { Note "Entra: registered, device id $($registered[0].Groups[1].Value)" }
+    else { Note 'Entra: not joined or registered to E29' }
+    $mdm = @(Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction SilentlyContinue | Get-ItemProperty -ErrorAction SilentlyContinue | Where-Object { $_.ProviderID -eq 'MS DM Server' -and $_.UPN } | ForEach-Object { $_.UPN } | Sort-Object -Unique)
+    Note "Intune: $(if ($mdm.Count) { "enrolled as $($mdm -join ', ')" } else { 'not enrolled' })"
+    # Built-in adapters only: a USB dock's MAC moves between laptops.
+    foreach ($nic in @(Get-Safe { Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.MacAddress -and $_.InterfaceDescription -notmatch 'USB' } })) { Note "Network: $($nic.InterfaceDescription), MAC $($nic.MacAddress)" }
+    $secureBoot = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' -ErrorAction SilentlyContinue).UEFISecureBootEnabled
+    Note "Secure Boot: $(if ($secureBoot -eq 1) { 'on' } elseif ($null -ne $secureBoot) { 'off' } else { 'not supported' })"
+    Note "TPM: $(@(Get-Safe { Get-CimInstance Win32_PnPEntity -Filter "PNPClass='SecurityDevices'" -ErrorAction Stop } | Where-Object { $_.Name -match 'Trusted Platform Module' } | ForEach-Object { $_.Name }) -join ', ')"
+
+    # Posture: read only in both modes; each TODO says what the user fixes.
+    # Shell values: 1 on, 2 off, 3 encrypting, 4 decrypting, 5 suspended, 6 on and locked, 8 waiting
+    # for activation. Win32_EncryptableVolume needs admin rights; this does not.
+    $bitlocker = Get-Safe { (New-Object -ComObject Shell.Application).NameSpace("$env:SystemDrive\").Self.ExtendedProperty('System.Volume.BitLockerProtection') }
+    $bitlockerText = if ($null -ne $bitlocker) { @{ 0 = 'not supported'; 1 = 'on'; 2 = 'off'; 3 = 'encrypting'; 4 = 'decrypting'; 5 = 'suspended'; 6 = 'on'; 8 = 'waiting for activation' }[[int]$bitlocker] }
+    if ($null -eq $bitlocker) { Note 'Could not read the disk encryption state.' }
+    elseif ($bitlocker -in 1, 3, 6) { Say OK "Disk encryption (BitLocker) on $env:SystemDrive is $bitlockerText." }
+    else { Say TODO "Disk encryption (BitLocker) on $env:SystemDrive is $(if ($bitlockerText) { $bitlockerText } else { "in state $bitlocker" }). Turn it on: Settings > Privacy & security > Device encryption; on Windows Pro search BitLocker and choose Turn on BitLocker. Save the recovery key in Bitwarden." }
+
+    # Every product Windows Security knows: Bitdefender turns Microsoft Defender off.
+    # productState: 0x1000 = on, 0x10 = definitions out of date.
+    $av = @(Get-Safe { Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop })
+    foreach ($a in $av) { Note ('Antivirus: {0}, {1}, {2}' -f $a.displayName, $(if ($a.productState -band 0x1000) { 'on' } else { 'off' }), $(if ($a.productState -band 0x10) { 'out of date' } else { 'up to date' })) }
+    $avGood = @($av | Where-Object { ($_.productState -band 0x1000) -and -not ($_.productState -band 0x10) })
+    if ($avGood.Count) { Say OK "Antivirus $(@($avGood | ForEach-Object { $_.displayName }) -join ', ') is on and up to date." }
+    else { Say TODO "No antivirus is on and up to date$(if ($av.Count) { " ($(@($av | ForEach-Object { $_.displayName }) -join ', '))" }). Open Windows Security > Virus & threat protection, turn it on and choose Check for updates." }
+
+    # Windows packages only: the update history also lists daily Defender definitions. Patch Tuesdays
+    # can be 35 days apart, so an up-to-date laptop may show 34 days.
+    $lastUpdate = Get-Safe { Get-HotFix -ErrorAction Stop | Where-Object { $_.InstalledOn } | Sort-Object InstalledOn -Descending | Select-Object -First 1 }
+    if ($lastUpdate) {
+        $days = [int]((Get-Date) - $lastUpdate.InstalledOn).TotalDays
+        $text = "Last Windows update $($lastUpdate.HotFixID) on $($lastUpdate.InstalledOn.ToString('yyyy-MM-dd')), $days days ago."
+        if ($days -le 40) { Say OK $text } else { Say TODO "$text Settings > Windows Update > Check for updates, install everything and restart." }
+    }
+    else { Note 'Could not read the last Windows update.' }
+
+    $sysDrive = Get-Safe { [IO.DriveInfo]::new($env:SystemDrive) }
+    if ($sysDrive.TotalSize) {
+        $text = '{0} has {1:N0} GB free of {2:N0} GB ({3:P0}).' -f $env:SystemDrive, ($sysDrive.AvailableFreeSpace / 1GB), ($sysDrive.TotalSize / 1GB), ($sysDrive.AvailableFreeSpace / $sysDrive.TotalSize)
+        if ($sysDrive.AvailableFreeSpace / $sysDrive.TotalSize -ge 0.1) { Say OK $text } else { Say TODO "$text Free up space: Settings > System > Storage > Cleanup recommendations." }
+    }
 
     # --- 2. Apps ---
     Section '2. Apps and settings'
