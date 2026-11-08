@@ -15,7 +15,6 @@ param([switch] $Check, [switch] $MachineOnly)
         @{ Name = 'Discord'; Id = 'Discord.Discord'; Scope = 'user' }
         @{ Name = 'Bitwarden'; Id = 'Bitwarden.Bitwarden'; Scope = 'user' }
         @{ Name = 'Claude Desktop'; Id = 'Anthropic.Claude'; Scope = 'user' }
-        @{ Name = 'SumatraPDF'; Id = 'SumatraPDF.SumatraPDF'; Scope = 'user' }
         @{ Name = 'PowerToys'; Id = 'Microsoft.PowerToys'; Scope = 'user' }
         @{ Name = 'Obsidian'; Id = 'Obsidian.Obsidian'; Scope = 'user' }
         @{ Name = 'FFmpeg'; Id = 'Gyan.FFmpeg'; Scope = 'user'; Command = 'ffmpeg' }
@@ -62,8 +61,13 @@ param([switch] $Check, [switch] $MachineOnly)
     function Note($msg, $color = 'Gray') { Write-Host "       $msg" -ForegroundColor $color; Log "       $msg" }
     function Section($title) { Write-Host "`n$title" -ForegroundColor Cyan; Log "`n== $title" }
     # Installers write PATH to the registry, which this session never re-reads.
-    function Update-Path { $env:Path = @([Environment]::GetEnvironmentVariable('Path', 'Machine'), [Environment]::GetEnvironmentVariable('Path', 'User'), $env:Path) -join ';' }
-    function Find-Exe($name) { Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source }
+    # Each entry once: repeated calls must not grow PATH towards its 32767-character limit.
+    function Update-Path {
+        $env:Path = @(@([Environment]::GetEnvironmentVariable('Path', 'Machine'), [Environment]::GetEnvironmentVariable('Path', 'User'), $env:Path) -join ';' -split ';' |
+                Where-Object { $_ } | Select-Object -Unique) -join ';'
+    }
+    # .exe or .cmd only: npm also puts an extensionless sh shim on PATH that Windows cannot start.
+    function Find-Exe($name) { Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.exe', '.cmd' } | Select-Object -First 1 -ExpandProperty Source }
 
     # Built into Windows 11, and winget does not list that copy.
     function Test-WebView2 {
@@ -73,7 +77,8 @@ param([switch] $Check, [switch] $MachineOnly)
         }
         $false
     }
-    # Installed from any source counts: winget also lists Store and preinstalled copies.
+    # Installed from any source counts: winget also lists Store and preinstalled copies. One list per
+    # app: a single winget export misses some of them.
     function Test-App($app) {
         if ($app.Test -and (& $app.Test)) { return $true }
         if ($app.Command -and (Find-Exe $app.Command)) { return $true }
@@ -92,6 +97,13 @@ param([switch] $Check, [switch] $MachineOnly)
     # Elevated copy: machine-wide apps only, then back to the first window.
     if ($MachineOnly) {
         Write-Host "`nE29 setup - apps for all users`n" -ForegroundColor White
+        # winget is per user, and the admin who typed the password may never have had it.
+        if (-not (Find-Exe winget)) {
+            Write-Host '[FAIL] winget is not available for this admin account.' -ForegroundColor Red
+            Start-Sleep -Seconds 10
+            # Safe here: this copy runs from a file, never under irm | iex. 3 tells the first window why.
+            exit 3
+        }
         foreach ($app in @($Apps | Where-Object { $_.Scope -eq 'machine' })) {
             if (Test-App $app) { continue }
             $code = Install-App $app
@@ -167,8 +179,24 @@ param([switch] $Check, [switch] $MachineOnly)
         if (-not $match.Success) { return $null }
         $match.Groups[1].Value.Contains('"user:plugins"')
     }
-    function Test-E29SignIn($auth) {
-        $auth -and $auth.loggedIn -and (-not $auth.orgId -or $auth.orgId -eq $e29OrgId) -and (Get-PluginScope) -ne $false
+    # A sign-in that names no organisation is not sent to log in again; after a login it must be E29.
+    function Test-E29SignIn($auth, [switch] $Strict) {
+        $auth -and $auth.loggedIn -and ($auth.orgId -eq $e29OrgId -or (-not $Strict -and -not $auth.orgId)) -and (Get-PluginScope) -ne $false
+    }
+    function Update-Claude {
+        $before = (& $claude --version 2>$null) -join ' '
+        [void](Invoke-Claude update)
+        $after = (& $claude --version 2>$null) -join ' '
+        if ($after -ne $before) { Say FIXED "Updated Claude Code: $before to $after" }
+    }
+    # A running Claude holds its plugin folder open; Claude Desktop also starts itself after install.
+    # $true = no Claude runs.
+    function Wait-ClaudeQuit {
+        while (@(Get-Process -Name claude -ErrorAction SilentlyContinue).Count) {
+            Note 'Claude is running. Quit Claude Desktop (also right-click its tray icon next to the clock and choose Quit) and close every Claude Code window, including inside VS Code.' Yellow
+            if ((Read-Host '       Press Enter to check again, or type S and Enter to skip') -eq 'S') { return $false }
+        }
+        $true
     }
     # Why the claude.ai copy on disk is old or missing: sign-in, and what the last sync wrote.
     function Show-SyncInfo($core) {
@@ -212,9 +240,6 @@ param([switch] $Check, [switch] $MachineOnly)
         return
     }
     Say OK "Windows $([Environment]::OSVersion.Version.Build), winget $((winget --version) -join '')."
-    if (@(Get-Process -Name claude -ErrorAction SilentlyContinue).Count) {
-        Note 'Claude is running. If the Claude step has to reset its plugin download, quit Claude first (also its tray icon) and paste this again.' Yellow
-    }
 
     # --- 2. Apps ---
     Section '2. Apps'
@@ -237,6 +262,7 @@ param([switch] $Check, [switch] $MachineOnly)
                     [IO.File]::WriteAllText($selfPath, $selfText, (New-Object Text.UTF8Encoding $true))
                     $p = Start-Process powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$selfPath`" -MachineOnly"
                     Log "elevated step exited $($p.ExitCode)"
+                    if ($p.ExitCode -eq 3) { Note 'The admin account has no winget. The admin signs in to Windows once and updates App Installer from the Microsoft Store, then paste this again.' Yellow }
                     # Tried there; its window showed each winget result.
                     foreach ($app in $machine) { $codes[$app.Id] = $null }
                 }
@@ -286,16 +312,20 @@ param([switch] $Check, [switch] $MachineOnly)
         Set-Variable -Name claude -Value $claude -Scope 1
 
         # Sign-in: the E29 organisation, with the user:plugins scope the claude.ai plugin sync needs.
+        # An old Claude Code gives no readable sign-in and does not sync claude.ai plugins: update it first.
         $auth = Get-Auth
+        $updated = $false
+        if (-not $auth -and -not $Check) { Update-Claude; $updated = $true; $auth = Get-Auth }
         if ($auth.configDirectory) { Set-Variable -Name cfg -Value $auth.configDirectory -Scope 1; $cfg = $auth.configDirectory }
-        if (Test-E29SignIn $auth) { Say OK "Signed in to Claude as $($auth.email)$(if ($auth.orgName) { " ($($auth.orgName))" })." }
+        if (-not $auth) { Note "Could not read the Claude sign-in; carrying on. To see why:  & '$claude' auth status" Yellow }
+        elseif (Test-E29SignIn $auth) { Say OK "Signed in to Claude as $($auth.email)$(if ($auth.orgName) { " ($($auth.orgName))" })." }
         elseif ($Check) { Say TODO "Claude is $(if ($auth.loggedIn) { "signed in as $($auth.email) ($($auth.orgName)), not with an E29 account that can download plugins" } else { 'not signed in' })." }
         else {
             Note "Claude is $(if ($auth.loggedIn) { "signed in as $($auth.email) ($($auth.orgName))" } else { 'not signed in' }). A browser opens now:" Yellow
             Note 'sign in with your E29 claude.ai account, then come back to this window.' Yellow
             & $claude auth login --claudeai
             $auth = Get-Auth
-            if (Test-E29SignIn $auth) { Say FIXED "Signed in to Claude as $($auth.email) (E29)." }
+            if (Test-E29SignIn $auth -Strict) { Say FIXED "Signed in to Claude as $($auth.email) (E29)." }
             else { Say FAIL "Claude is still not signed in with an E29 account that can download plugins ($($auth.email), $($auth.orgName))."; return }
         }
 
@@ -314,12 +344,9 @@ param([switch] $Check, [switch] $MachineOnly)
                 if ((Get-Major $core.version) -ge 2 -or (Get-UploadedCore)) { break }
                 if ($reset -eq 'update') {
                     Note "e29-core is $(if ($core) { "old ($($core.version))" } else { 'missing' }); getting the current version from claude.ai..." Yellow
-                    $before = (& $claude --version 2>$null) -join ' '
-                    [void](Invoke-Claude update)
-                    $after = (& $claude --version 2>$null) -join ' '
-                    if ($after -ne $before) { Say FIXED "Updated Claude Code: $before to $after" }
+                    if (-not $updated) { Update-Claude }
                 }
-                elseif (@(Get-Process -Name claude -ErrorAction SilentlyContinue).Count) {
+                elseif (-not (Wait-ClaudeQuit)) {
                     Say TODO 'Claude is still running, so its plugin download folder was not reset. Quit Claude everywhere (also its tray icon), then paste this again.'
                     break
                 }
@@ -362,11 +389,19 @@ param([switch] $Check, [switch] $MachineOnly)
                 if ($run.Ok) { Say FIXED 'Removed the old e29-core marketplace.' } else { Say FAIL "Could not remove the old e29-core marketplace: $($run.Out)" }
             }
         }
-        if ($ready -and -not $Check) {
-            foreach ($dir in "$cfg\plugins\cache\e29-core", "$cfg\plugins\marketplaces\e29-core") {
-                if (-not (Test-Path $dir)) { continue }
-                if (Remove-Dir $dir) { Say FIXED "Deleted leftover folder $dir" }
-                else { Say TODO "Could not delete leftover folder $dir (a file is in use). Restart Windows and paste this again." }
+        # Folders go only once Claude itself no longer lists the old plugin or marketplace: a failed
+        # remove or an unreadable list must not leave a registered plugin without its files.
+        $leftover = @("$cfg\plugins\cache\e29-core", "$cfg\plugins\marketplaces\e29-core" | Where-Object { Test-Path $_ })
+        if ($ready -and -not $Check -and $leftover.Count) {
+            $plugins = Get-ClaudeJson plugin list --json
+            $markets = Get-ClaudeJson plugin marketplace list --json
+            if ($null -eq $plugins -or $null -eq $markets) { Say FAIL "Could not read the Claude plugin lists, so the old e29-core folders were kept. Run this to see why:  & '$claude' plugin list" }
+            elseif (-not @($plugins | Where-Object { $_.id -eq 'e29-core@e29-core' -and ($_.scope -eq 'user' -or ($_.projectPath -and (Test-Path $_.projectPath))) }).Count -and
+                -not @($markets | Where-Object { $_.name -eq 'e29-core' }).Count) {
+                foreach ($dir in $leftover) {
+                    if (Remove-Dir $dir) { Say FIXED "Deleted leftover folder $dir" }
+                    else { Say TODO "Could not delete leftover folder $dir (a file is in use). Restart Windows and paste this again." }
+                }
             }
         }
 
@@ -478,13 +513,26 @@ param([switch] $Check, [switch] $MachineOnly)
 
         function Get-Pm { $list = Get-ClaudeJson plugin list --json; $list | Where-Object { $_.id -eq 'e29-pm@e29-pm' -and $_.scope -eq 'user' } | Select-Object -First 1 }
         $installed = Get-Pm
-        if ($installed) { Say OK "e29-pm $($installed.version) is installed." }
-        elseif ($Check) { Say TODO 'e29-pm is not installed.' }
-        else {
+        if ($Check) { }
+        elseif (-not $installed) {
             $run = Invoke-Claude plugin install e29-pm@e29-pm --scope user
             $installed = Get-Pm
             if ($installed) { Say FIXED "Installed e29-pm $($installed.version)." } else { Say FAIL "Could not install e29-pm: $($run.Out)" }
         }
+        else {
+            # Installed: bring it up to date and turn it back on if it was turned off.
+            [void](Invoke-Claude plugin marketplace update e29-pm)
+            $run = Invoke-Claude plugin update e29-pm@e29-pm
+            if (-not $run.Ok) { Say FAIL "Could not update e29-pm: $($run.Out)" }
+            if (-not $installed.enabled) {
+                $run = Invoke-Claude plugin enable e29-pm@e29-pm --scope user
+                if ($run.Ok) { Say FIXED 'Turned e29-pm back on.' } else { Say FAIL "Could not turn e29-pm on: $($run.Out)" }
+            }
+            $installed = Get-Pm
+        }
+        if (-not $installed) { if ($Check) { Say TODO 'e29-pm is not installed.' } }
+        elseif ($installed.enabled -and (Get-Major $installed.version) -ge 2) { Say OK "e29-pm $($installed.version) is installed and on." }
+        else { Say $(if ($Check) { 'TODO' } else { 'FAIL' }) "e29-pm is version $($installed.version), on=$($installed.enabled); it must be 2 or higher and on." }
 
         # No CLI flag turns on auto-update: change only that leaf in settings.json, keep the rest
         # byte for byte, and never write a file that does not parse.
@@ -492,9 +540,10 @@ param([switch] $Check, [switch] $MachineOnly)
         try {
             $text = [IO.File]::ReadAllText($settingsPath)
             $entry = ($text | ConvertFrom-Json -ErrorAction Stop).extraKnownMarketplaces.'e29-pm'
-            if (-not $entry) { Say TODO "e29-pm auto-update: no e29-pm marketplace in $settingsPath yet." }
+            # SKIP, not TODO: nothing for the user to do, and this script updates e29-pm on each run.
+            if (-not $entry) { Say SKIP "e29-pm auto-update: no e29-pm marketplace in $settingsPath to turn it on in." }
             elseif ($entry.autoUpdate -eq $true) { Say OK 'e29-pm updates itself.' }
-            elseif ($null -ne $entry.autoUpdate) { Say TODO "e29-pm auto-update is turned off in $settingsPath; left as is." }
+            elseif ($null -ne $entry.autoUpdate) { Say SKIP "e29-pm auto-update is turned off in $settingsPath; left as is." }
             elseif ($Check) { Say TODO 'e29-pm auto-update is not on.' }
             else {
                 # Inserted first in the object, with the indentation of the line it goes before.
