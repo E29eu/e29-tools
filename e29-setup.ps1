@@ -53,8 +53,9 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
     $claudeInstallerUrl = 'https://claude.ai/install.ps1'
     $kb = 'https://kb.e29.eu'
     # healthchecks.io check e29-setup (project E29) receives every log. It keeps only a log whose
-    # first line names an E29 Microsoft 365 domain (body keyword filter); anything else is ignored.
-    $logUrl = ''
+    # first line names an E29 Microsoft 365 domain with users (HTTP body keyword filter); anything
+    # else is ignored. A new staff domain goes into the check's success and failure keywords.
+    $logUrl = 'https://hc-ping.com/a9cddf4c-a6a4-4e63-9ce3-20f1bec8e5d0'
 
     # The whole script text, for the elevated copy: `irm | iex` leaves no file to start again.
     $root = $MyInvocation.MyCommand.ScriptBlock.Ast
