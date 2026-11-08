@@ -1,4 +1,4 @@
-param([switch] $Check, [switch] $MachineOnly)
+param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant)
 & {
     # E29 staff computer setup: apps, Claude with the E29 plugins, GitHub sign-in and git identity.
     # Safe to run again: it checks first, changes only what is missing, then verifies. In PowerShell:
@@ -30,6 +30,15 @@ param([switch] $Check, [switch] $MachineOnly)
         @{ Name = 'Python'; Id = 'Python.Python.3.13'; Scope = 'user'; Command = 'py'; Custom = 'PrependPath=1' }
     )
 
+    # SharePoint libraries OneDrive syncs by itself (AutoMountTeamSites policy). IDs from the
+    # library's Sync > Copy library ID. Pm = only for whoever can read the PM plugin repo.
+    # Microsoft supports the policy only for libraries under 5,000 files and folders.
+    $tenantId = '49d5cd76-822a-4768-a27e-56c9ad7b2e3f'
+    $Libraries = @(
+        @{ Name = 'Project - Documents'; Url = 'https://e29eu.sharepoint.com/sites/project'; Site = '7e3c26de-33a6-4d93-b9cf-2e5b9264367a'; Web = '351d6e06-e5ff-4dec-9be0-bf40723a275c'; List = '6d415ab9-831c-4edc-885d-e224fd336ef2' }
+        @{ Name = 'Grant - Documents'; Url = 'https://e29eu.sharepoint.com/sites/grant'; Site = 'e67617b3-3948-4e3d-b82b-721ce3e8f00d'; Web = 'c66f90f0-cebb-42f7-ad3e-b1540c65d63e'; List = '174496ff-101e-4ba0-9e95-61e06c839fd4'; Pm = $true }
+    )
+
     $ErrorActionPreference = 'Continue'
     $state = @{ OK = 0; FIXED = 0; SKIP = 0; TODO = 0; FAIL = 0 }
     $logPath = Join-Path $env:TEMP 'e29-setup.log'
@@ -44,8 +53,9 @@ param([switch] $Check, [switch] $MachineOnly)
     $claudeInstallerUrl = 'https://claude.ai/install.ps1'
     $kb = 'https://kb.e29.eu'
     # healthchecks.io check e29-setup (project E29) receives every log. It keeps only a log whose
-    # first line names an E29 Microsoft 365 domain (body keyword filter); anything else is ignored.
-    $logUrl = ''
+    # first line names an E29 Microsoft 365 domain with users (HTTP body keyword filter); anything
+    # else is ignored. A new staff domain goes into the check's success and failure keywords.
+    $logUrl = 'https://hc-ping.com/a9cddf4c-a6a4-4e63-9ce3-20f1bec8e5d0'
 
     # The whole script text, for the elevated copy: `irm | iex` leaves no file to start again.
     $root = $MyInvocation.MyCommand.ScriptBlock.Ast
@@ -127,10 +137,54 @@ param([switch] $Check, [switch] $MachineOnly)
     }
     function Get-InstallHint($app) { "winget install --id $($app.Id) --exact --scope $($app.Scope)" }
 
-    # Elevated copy: machine-wide apps only, then back to the first window.
+    # --- Policies --- only an admin can write them, the user's own policy key too. The elevated copy
+    # writes that key by the user's SID, so it lands on the right user whichever admin approves.
+    $sid = if ($UserSid) { $UserSid } else { [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
+    function Get-Library($grant) { $Libraries | Where-Object { $grant -or -not $_.Pm } }
+    function Get-Policy($grant) {
+        foreach ($lib in @(Get-Library $grant)) {
+            $id = "tenantId=$tenantId&siteId=%7B$($lib.Site)%7D&webId=%7B$($lib.Web)%7D&listId=%7B$($lib.List)%7D&webUrl=$([uri]::EscapeDataString($lib.Url))&version=1"
+            @{ Label = "OneDrive syncs $($lib.Name)"; Key = "Registry::HKEY_USERS\$sid\Software\Policies\Microsoft\OneDrive\TenantAutoMount"; Name = $lib.Name; Value = $id }
+        }
+        # Bitwarden replaces the browsers' own password managers. Its server URL stays a manual step.
+        foreach ($b in @(
+                @{ Name = 'Chrome'; Key = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome'; Ext = 'nngceckbapebfimnlniiiahkandclblb;https://clients2.google.com/service/update2/crx' },
+                @{ Name = 'Edge'; Key = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Edge'; Ext = 'jbkfoedolllekgbhcbcoahefnbanhhlh;https://edge.microsoft.com/extensionwebstorebase/v1/crx' })) {
+            @{ Label = "$($b.Name) password manager is off"; Key = $b.Key; Name = 'PasswordManagerEnabled'; Value = 0 }
+            @{ Label = "$($b.Name) installs the Bitwarden extension"; Key = "$($b.Key)\ExtensionInstallForcelist"; List = $b.Ext }
+        }
+    }
+    # List = one entry of a numbered list policy, added after any entries already there.
+    function Test-Policy($p) {
+        $item = Get-Item -LiteralPath $p.Key -ErrorAction SilentlyContinue
+        if (-not $item) { return $false }
+        if ($p.List) { return [bool]@($item.GetValueNames() | Where-Object { "$($item.GetValue($_))".Split(';')[0] -eq $p.List.Split(';')[0] }).Count }
+        "$($item.GetValue($p.Name))" -eq "$($p.Value)"
+    }
+    function Set-Policy($p) {
+        if (Test-Policy $p) { return }
+        try {
+            if (-not (Test-Path -LiteralPath $p.Key)) { $null = New-Item -Path $p.Key -Force -ErrorAction Stop }
+            if ($p.List) {
+                $names = @((Get-Item -LiteralPath $p.Key).GetValueNames())
+                $n = 1; while ($names -contains "$n") { $n++ }
+                $null = New-ItemProperty -LiteralPath $p.Key -Name "$n" -Value $p.List -PropertyType String -Force -ErrorAction Stop
+            }
+            else { $null = New-ItemProperty -LiteralPath $p.Key -Name $p.Name -Value $p.Value -PropertyType $(if ($p.Value -is [int]) { 'DWord' } else { 'String' }) -Force -ErrorAction Stop }
+        }
+        catch { Log "policy $($p.Label): $($_.Exception.Message)" }
+    }
+
+    # Elevated copy: machine-wide apps and policies only, then back to the first window.
     if ($MachineOnly) {
-        Write-Host "`nE29 setup - apps for all users`n" -ForegroundColor White
-        # winget is per user, and the admin who typed the password may never have had it.
+        Write-Host "`nE29 setup - apps and settings for all users`n" -ForegroundColor White
+        foreach ($p in @(Get-Policy $Grant | Where-Object { -not (Test-Policy $_) })) {
+            Set-Policy $p
+            if (Test-Policy $p) { Write-Host "[FIXED] $($p.Label)." -ForegroundColor Green }
+            else { Write-Host "[FAIL] Could not set: $($p.Label)." -ForegroundColor Red }
+        }
+        # winget is per user, and the admin who typed the password may never have had it. The
+        # policies above need no winget.
         if (-not (Find-Exe winget)) {
             Write-Host '[FAIL] winget is not available for this admin account.' -ForegroundColor Red
             Start-Sleep -Seconds 10
@@ -276,29 +330,43 @@ param([switch] $Check, [switch] $MachineOnly)
     Say OK "Windows $([Environment]::OSVersion.Version.Build), winget $((winget --version) -join '')."
 
     # --- 2. Apps ---
-    Section '2. Apps'
+    Section '2. Apps and settings'
+    # Grant - Documents follows the PM plugin repo access. gh is not signed in on a first run: the
+    # next run adds it.
+    $grantAccess = $false
+    if ($ghExe = Find-Exe gh) { & $ghExe api "repos/$pmRepo" --silent 2>$null; $grantAccess = $LASTEXITCODE -eq 0 }
+    $policies = @(Get-Policy $grantAccess)
     $missing = @($Apps | Where-Object { -not (Test-App $_) })
+    $unset = @($policies | Where-Object { -not (Test-Policy $_) })
     foreach ($app in @($Apps | Where-Object { $missing -notcontains $_ })) { Say OK "$($app.Name) is installed." }
+    foreach ($p in @($policies | Where-Object { $unset -notcontains $_ })) { Say OK "$($p.Label)." }
     if ($Check) {
         foreach ($app in $missing) { Say TODO "$($app.Name) is not installed." }
+        foreach ($p in $unset) { Say TODO "Not set yet: $($p.Label)." }
     }
     else {
         $codes = @{}
+        $elevated = $false
         foreach ($app in @($missing | Where-Object { $_.Scope -eq 'user' })) { $codes[$app.Id] = Install-App $app }
         $machine = @($missing | Where-Object { $_.Scope -eq 'machine' })
-        if ($machine.Count) {
+        if ($machine.Count -or $unset.Count) {
             $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-            if ($isAdmin) { foreach ($app in $machine) { $codes[$app.Id] = Install-App $app } }
+            if ($isAdmin) {
+                foreach ($app in $machine) { $codes[$app.Id] = Install-App $app }
+                foreach ($p in $unset) { Set-Policy $p }
+                $elevated = $true
+            }
             else {
-                Note "$($machine.Count) app(s) install for all users. Windows asks for admin rights once: choose Yes." Yellow
+                Note "Some apps and settings are for all users. Windows asks for admin rights once: choose Yes." Yellow
                 $selfPath = Join-Path $env:TEMP 'e29-setup.ps1'
                 try {
                     [IO.File]::WriteAllText($selfPath, $selfText, (New-Object Text.UTF8Encoding $true))
-                    $p = Start-Process powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$selfPath`" -MachineOnly"
+                    $p = Start-Process powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$selfPath`" -MachineOnly -UserSid $sid$(if ($grantAccess) { ' -Grant' })"
                     Log "elevated step exited $($p.ExitCode)"
                     if ($p.ExitCode -eq 3) { Note 'The admin account has no winget. The admin signs in to Windows once and updates App Installer from the Microsoft Store, then paste this again.' Yellow }
                     # Tried there; its window showed each winget result.
                     foreach ($app in $machine) { $codes[$app.Id] = $null }
+                    $elevated = $true
                 }
                 catch { Note "No admin rights: $($_.Exception.Message)" }
             }
@@ -311,6 +379,23 @@ param([switch] $Check, [switch] $MachineOnly)
             }
             else { Say FAIL "Could not install $($app.Name)$(if ($null -ne $codes[$app.Id]) { " (winget exit $($codes[$app.Id]))" }). Try:  $(Get-InstallHint $app)" }
         }
+        foreach ($p in $unset) {
+            if (Test-Policy $p) { Say FIXED "$($p.Label)." }
+            elseif (-not $elevated) { Say TODO "Not set: $($p.Label). It needs admin rights: someone with admin rights pastes this again." }
+            else { Say FAIL "Could not set: $($p.Label)." }
+        }
+    }
+
+    # Shows .pdf and .docx, so nobody saves x.pdf.pdf.
+    $explorer = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+    if ((Get-ItemProperty -LiteralPath $explorer -Name HideFileExt -ErrorAction SilentlyContinue).HideFileExt -eq 0) { Say OK 'File Explorer shows file extensions.' }
+    elseif ($Check) { Say TODO 'File Explorer hides file extensions.' }
+    else {
+        try {
+            Set-ItemProperty -LiteralPath $explorer -Name HideFileExt -Value 0 -Type DWord -ErrorAction Stop
+            Say FIXED 'File Explorer shows file extensions from the next sign-in.'
+        }
+        catch { Say FAIL "Could not make File Explorer show file extensions: $($_.Exception.Message)" }
     }
 
     # Claude Code in VS Code, for website editing. No VS Code: its app line above already says so.
@@ -329,6 +414,7 @@ param([switch] $Check, [switch] $MachineOnly)
     # Kept, never upgraded: other software may pin an old version. Missing: its app line says so.
     $nodeVersion = Get-ToolVersion node
     if ($nodeVersion -and $nodeVersion -lt [version]'18.0') { Say FAIL "Node.js $nodeVersion is too old: E29 Dataverse needs 18 or newer. Try:  winget install --id OpenJS.NodeJS.LTS --exact" }
+    elseif ($nodeVersion -and $nodeVersion -lt [version]'24.0') { Say TODO "Node.js $nodeVersion is old: the E29 websites need 24. Run:  winget upgrade --id OpenJS.NodeJS.LTS --exact" }
     # The skills call python; fill-travel-distance needs 3.11 (enum.StrEnum).
     $pythonVersion = Get-ToolVersion python
     if (-not $pythonVersion) { if (Find-Exe py) { Say TODO 'python opens the Microsoft Store. Turn it off: Settings > Apps > Advanced app settings > App execution aliases > python.exe and python3.exe off. Then paste this again.' } }
@@ -560,7 +646,32 @@ param([switch] $Check, [switch] $MachineOnly)
         $found = @(Find-Root @($userHome, $oneDriveParent) @('Grant - Documents', 'Project - Documents', 'Project - Dissemination', 'Project - Output'))
         if ($found.Count -eq 1) { Set-UserVariable $var $found[0] }
         elseif ($found.Count) { Say TODO "$var is not set: several folders look like the E29 SharePoint folder ($($found -join '; ')). Run, with the right one:  [Environment]::SetEnvironmentVariable('$var', '<folder>', 'User')" }
-        else { Say TODO "$var is not set: no E29 SharePoint library is synced to this computer. In SharePoint open Project - Documents, choose Sync, then paste this again." }
+        else { Say TODO "$var is not set: no E29 SharePoint library is on this computer yet. OneDrive adds Project - Documents within 8 hours of this setup: paste this again tomorrow." }
+    }
+
+    # OneDrive signed in to E29, and the libraries the policies mount kept on this computer
+    # ("Always keep on this device"). The policy mounts them online-only.
+    $oneDrive = @(Get-ItemProperty 'HKCU:\Software\Microsoft\OneDrive\Accounts\Business*' -ErrorAction SilentlyContinue | Where-Object { $_.ConfiguredTenantId -eq $tenantId })
+    if ($oneDrive.Count) { Say OK "OneDrive is signed in as $($oneDrive[0].UserEmail)." }
+    else { Say TODO 'OneDrive is not signed in with your E29 account. Open OneDrive from the Start menu and sign in with your @e29.eu address.' }
+    $spRoot = [Environment]::GetEnvironmentVariable($var, 'User')
+    foreach ($lib in @(Get-Library $grantAccess)) {
+        $folder = if ($spRoot) { Join-Path $spRoot $lib.Name }
+        if (-not $folder -or -not (Test-Path -LiteralPath $folder -PathType Container)) {
+            if ($spRoot) { Say TODO "$($lib.Name) is not on this computer yet: OneDrive adds it within 8 hours of this setup. Paste this again tomorrow." }
+            continue
+        }
+        # 0x80000 = pinned.
+        $pinned = { [bool]((Get-Item -LiteralPath $folder -Force).Attributes -band 0x80000) }
+        if (& $pinned) { Say OK "$($lib.Name) is kept on this computer."; continue }
+        if ($Check) { Say TODO "$($lib.Name) is online-only, not kept on this computer."; continue }
+        $size = (Get-ChildItem -LiteralPath $folder -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+        $free = ([IO.DriveInfo]::new([IO.Path]::GetPathRoot($folder))).AvailableFreeSpace
+        # 5 GB left over for Windows and everything else.
+        if ($size -gt $free - 5GB) { Say TODO ('{0} needs {1:N1} GB and the disk has {2:N1} GB free, so it stays online-only. Free up space, then paste this again.' -f $lib.Name, ($size / 1GB), ($free / 1GB)); continue }
+        Log (@(attrib -U +P $folder 2>&1; attrib -U +P "$folder\*" /S /D 2>&1) -join "`n")
+        if (& $pinned) { Say FIXED ('Keeping {0} on this computer; OneDrive downloads {1:N1} GB in the background.' -f $lib.Name, ($size / 1GB)) }
+        else { Say FAIL "Could not keep $($lib.Name) on this computer. In File Explorer right-click it and choose Always keep on this device." }
     }
 
     # A ;-separated list of NAS roots, the folders holding photo\. Off the office network every one

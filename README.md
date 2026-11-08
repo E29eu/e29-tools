@@ -9,7 +9,13 @@ claude.ai organisation), GitHub sign-in and git name and email. Senior members w
 project-management plugin repo also get `e29-pm`. Safe to run again: it checks first, changes only
 what is missing, then verifies. It also installs what the E29 Claude skills need (Node.js, Python,
 `keyring`), sets the folder variables they read, and removes the old `E29 Dataverse` entry from
-Claude Desktop's config, which doubled every Dataverse tool. Full log: `%TEMP%\e29-setup.log`; every run
+Claude Desktop's config, which doubled every Dataverse tool.
+
+In the same admin step it sets policies: OneDrive syncs `Project - Documents` (and `Grant - Documents`
+for whoever can read the PM plugin repo) by itself, Chrome and Edge install the Bitwarden extension
+and turn off their own password managers. Once OneDrive has added a library (up to 8 hours after
+the setup), the next run keeps it on the computer. It also makes File Explorer show file
+extensions. The library list is the `$Libraries` table at the top of the script. Full log: `%TEMP%\e29-setup.log`; every run
 also posts it to the healthchecks.io check `e29-setup`, which keeps only logs from E29 Microsoft 365
 domains.
 
