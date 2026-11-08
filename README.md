@@ -25,7 +25,3 @@ Check only, changes nothing:
 ```
 
 The app list is the `$Apps` table at the top of the script.
-
-## e29-cleanup.ps1
-
-Replaced by [e29-setup.ps1](#e29-setupps1): the old link now runs it.

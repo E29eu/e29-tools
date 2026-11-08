@@ -8,28 +8,21 @@ param([switch] $Check, [switch] $MachineOnly)
     # Runs on Windows PowerShell 5.1 and pwsh 7. Never `exit`: under `irm | iex` it closes the window.
 
     # Install only what is missing; the apps update themselves. user = no admin rights needed;
-    # machine = one elevated step for all of them. Command or Test: how to see a copy winget does not list.
+    # machine = one elevated step for all of them. Command: how to see a copy winget does not list.
     $Apps = @(
         @{ Name = 'Teams'; Id = 'Microsoft.Teams'; Scope = 'user' }
-        @{ Name = 'Canva'; Id = 'Canva.Canva'; Scope = 'user' }
-        @{ Name = 'Discord'; Id = 'Discord.Discord'; Scope = 'user' }
         @{ Name = 'Bitwarden'; Id = 'Bitwarden.Bitwarden'; Scope = 'user' }
         @{ Name = 'Claude Desktop'; Id = 'Anthropic.Claude'; Scope = 'user' }
-        @{ Name = 'PowerToys'; Id = 'Microsoft.PowerToys'; Scope = 'user' }
         @{ Name = 'Obsidian'; Id = 'Obsidian.Obsidian'; Scope = 'user' }
         @{ Name = 'FFmpeg'; Id = 'Gyan.FFmpeg'; Scope = 'user'; Command = 'ffmpeg' }
         @{ Name = 'PowerShell 7'; Id = 'Microsoft.PowerShell'; Scope = 'user'; Command = 'pwsh' }
         @{ Name = 'ExifTool'; Id = 'OliverBetz.ExifTool'; Scope = 'user'; Command = 'exiftool' }
-        @{ Name = 'Edge WebView2 Runtime'; Id = 'Microsoft.EdgeWebView2Runtime'; Scope = 'user'; Test = { Test-WebView2 } }
-        @{ Name = 'Notepad++'; Id = 'Notepad++.Notepad++'; Scope = 'machine' }
+        @{ Name = 'VS Code'; Id = 'Microsoft.VisualStudioCode'; Scope = 'user'; Command = 'code' }
         @{ Name = 'Visual C++ Redistributable'; Id = 'Microsoft.VCRedist.2015+.x64'; Scope = 'machine' }
         @{ Name = 'Synology Drive Client'; Id = 'Synology.DriveClient'; Scope = 'machine' }
         @{ Name = 'Git'; Id = 'Git.Git'; Scope = 'machine'; Command = 'git' }
         @{ Name = 'GitHub CLI'; Id = 'GitHub.cli'; Scope = 'machine'; Command = 'gh' }
-        @{ Name = '7-Zip'; Id = '7zip.7zip'; Scope = 'machine' }
         @{ Name = 'Google Chrome'; Id = 'Google.Chrome'; Scope = 'machine' }
-        @{ Name = 'Mozilla Firefox'; Id = 'Mozilla.Firefox'; Scope = 'machine' }
-        @{ Name = 'K-Lite Codec Pack'; Id = 'CodecGuide.K-LiteCodecPack.Standard'; Scope = 'machine' }
     )
 
     $ErrorActionPreference = 'Continue'
@@ -69,18 +62,9 @@ param([switch] $Check, [switch] $MachineOnly)
     # .exe or .cmd only: npm also puts an extensionless sh shim on PATH that Windows cannot start.
     function Find-Exe($name) { Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.exe', '.cmd' } | Select-Object -First 1 -ExpandProperty Source }
 
-    # Built into Windows 11, and winget does not list that copy.
-    function Test-WebView2 {
-        foreach ($key in 'HKLM:\SOFTWARE\WOW6432Node', 'HKLM:\SOFTWARE', 'HKCU:\SOFTWARE') {
-            $pv = (Get-ItemProperty "$key\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" -ErrorAction SilentlyContinue).pv
-            if ($pv -and $pv -ne '0.0.0.0') { return $true }
-        }
-        $false
-    }
     # Installed from any source counts: winget also lists Store and preinstalled copies. One list per
     # app: a single winget export misses some of them.
     function Test-App($app) {
-        if ($app.Test -and (& $app.Test)) { return $true }
         if ($app.Command -and (Find-Exe $app.Command)) { return $true }
         $null = winget list --id $app.Id --exact --accept-source-agreements 2>&1
         $LASTEXITCODE -eq 0
@@ -116,7 +100,7 @@ param([switch] $Check, [switch] $MachineOnly)
         return
     }
 
-    # --- Claude helpers, also used by the old e29-cleanup.ps1 ---
+    # --- Claude helpers ---
     function Invoke-Claude {
         $out = (& $claude @args 2>&1 | ForEach-Object { "$_" }) -join ' '
         @{ Ok = ($LASTEXITCODE -eq 0); Out = $out }
@@ -230,8 +214,9 @@ param([switch] $Check, [switch] $MachineOnly)
 
     # --- 1. Preflight ---
     Section '1. This computer'
-    if ([Environment]::OSVersion.Version.Major -lt 10) {
-        Say FAIL "Windows $([Environment]::OSVersion.Version) is too old: this setup needs Windows 10 or 11."
+    # Windows 11 still reports major version 10; its builds start at 22000.
+    if ([Environment]::OSVersion.Version.Build -lt 22000) {
+        Say FAIL "Windows $([Environment]::OSVersion.Version) is too old: this setup needs Windows 11."
         return
     }
     if (-not (Find-Exe winget)) {
@@ -276,6 +261,19 @@ param([switch] $Check, [switch] $MachineOnly)
                 Say TODO "$($app.Name) is not installed: it needs admin rights. Ask someone with admin rights to run:  $(Get-InstallHint $app)"
             }
             else { Say FAIL "Could not install $($app.Name)$(if ($null -ne $codes[$app.Id]) { " (winget exit $($codes[$app.Id]))" }). Try:  $(Get-InstallHint $app)" }
+        }
+    }
+
+    # Claude Code in VS Code, for website editing. No VS Code: its app line above already says so.
+    $vscode = Find-Exe code
+    $extension = 'anthropic.claude-code'
+    if ($vscode) {
+        if (@(& $vscode --list-extensions 2>$null) -contains $extension) { Say OK 'Claude Code extension for VS Code is installed.' }
+        elseif ($Check) { Say TODO 'Claude Code extension for VS Code is not installed.' }
+        else {
+            Log ((& $vscode --install-extension $extension 2>&1 | ForEach-Object { "$_" }) -join "`n")
+            if (@(& $vscode --list-extensions 2>$null) -contains $extension) { Say FIXED 'Installed the Claude Code extension for VS Code.' }
+            else { Say FAIL "Could not install the Claude Code extension for VS Code. Try:  code --install-extension $extension" }
         }
     }
 
@@ -565,10 +563,9 @@ param([switch] $Check, [switch] $MachineOnly)
     # --- 6. What is left ---
     Section 'Still to do by hand (once per computer)'
     $left = @(
-        "Claude Desktop: Settings > Connectors > Microsoft 365 > Connect, sign in with your E29 Microsoft account. Guide: $kb/how-to-set-up-tools/claude-setup/",
+        "Claude Desktop: Settings > Connectors > Microsoft 365 > Connect, sign in with your E29 Microsoft account. Guide: $kb/getting-started/set-up-your-computer/#connect-microsoft-365",
         "Synology Drive Client: connect to the E29 NAS and sign in. Guide: $kb/getting-started/systems-and-accounts/",
-        "Bitwarden app and browser extension: server https://vault.e29.eu/ then sign in. Guide: $kb/how-to-set-up-tools/vaultwarden-guide/",
-        'Canva and Discord: open each and sign in.'
+        "Bitwarden app and browser extension: server https://vault.e29.eu/ then sign in. Guide: $kb/getting-started/set-up-your-computer/#set-up-bitwarden"
     )
     if ($pm) { $left += "Project management keys (Odoo, Fio, EU Login) into keyring: https://github.com/$pmRepo#readme" }
     $n = 0
