@@ -8,7 +8,8 @@ Sets up a staff Windows computer: apps, Claude Code with the E29 plugins (signed
 claude.ai organisation), GitHub sign-in and git name and email. Senior members who can read the
 project-management plugin repo also get `e29-pm`. Safe to run again: it checks first, changes only
 what is missing, then verifies. It also installs what the E29 Claude skills need (Node.js, Python,
-`keyring`) and sets the folder variables they read. Full log: `%TEMP%\e29-setup.log`; every run
+`keyring`), sets the folder variables they read, and removes the old `E29 Dataverse` entry from
+Claude Desktop's config, which doubled every Dataverse tool. Full log: `%TEMP%\e29-setup.log`; every run
 also posts it to the healthchecks.io check `e29-setup`, which keeps only logs from E29 Microsoft 365
 domains.
 
