@@ -23,6 +23,11 @@ param([switch] $Check, [switch] $MachineOnly)
         @{ Name = 'Git'; Id = 'Git.Git'; Scope = 'machine'; Command = 'git' }
         @{ Name = 'GitHub CLI'; Id = 'GitHub.cli'; Scope = 'machine'; Command = 'gh' }
         @{ Name = 'Google Chrome'; Id = 'Google.Chrome'; Scope = 'machine' }
+        # The E29 Dataverse connection runs through npx.
+        @{ Name = 'Node.js'; Id = 'OpenJS.NodeJS.LTS'; Scope = 'machine'; Command = 'node' }
+        # py, not python: Windows ships a python.exe that only opens the Store. PrependPath puts the
+        # real one before it.
+        @{ Name = 'Python'; Id = 'Python.Python.3.13'; Scope = 'user'; Command = 'py'; Custom = 'PrependPath=1' }
     )
 
     $ErrorActionPreference = 'Continue'
@@ -38,6 +43,9 @@ param([switch] $Check, [switch] $MachineOnly)
     $pmRepo = 'E29eu/claude-e29-pm-plugin'
     $claudeInstallerUrl = 'https://claude.ai/install.ps1'
     $kb = 'https://kb.e29.eu'
+    # healthchecks.io check e29-setup (project E29) receives every log. It keeps only a log whose
+    # first line names an E29 Microsoft 365 domain (body keyword filter); anything else is ignored.
+    $logUrl = ''
 
     # The whole script text, for the elevated copy: `irm | iex` leaves no file to start again.
     $root = $MyInvocation.MyCommand.ScriptBlock.Ast
@@ -61,17 +69,58 @@ param([switch] $Check, [switch] $MachineOnly)
     }
     # .exe or .cmd only: npm also puts an extensionless sh shim on PATH that Windows cannot start.
     function Find-Exe($name) { Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.exe', '.cmd' } | Select-Object -First 1 -ExpandProperty Source }
+    # major.minor from `<name> --version`; $null when missing or when it prints no version (the Store stub).
+    function Get-ToolVersion($name) {
+        if (-not ($exe = Find-Exe $name)) { return $null }
+        $out = (& $exe --version 2>&1 | ForEach-Object { "$_" }) -join ' '
+        if ($out -match '(\d+)\.(\d+)') { [version]"$($Matches[1]).$($Matches[2])" }
+    }
+    # Output of a command that may hang, or $null after $seconds. Ends the whole tree: a .cmd
+    # launcher (npm install) runs Claude as a child.
+    function Invoke-Timed($exe, $arguments, $seconds) {
+        $psi = [Diagnostics.ProcessStartInfo]::new($exe, $arguments)
+        $psi.UseShellExecute = $false
+        $psi.WorkingDirectory = $userHome
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $p = [Diagnostics.Process]::Start($psi)
+        $out = $p.StandardOutput.ReadToEndAsync()
+        $null = $p.StandardError.ReadToEndAsync()
+        if ($p.WaitForExit($seconds * 1000)) { return $out.Result }
+        taskkill /PID $p.Id /T /F 2>&1 | Out-Null
+    }
+    # Set once, read back: Group Policy can silently discard a User environment write.
+    function Set-UserVariable($name, $value) {
+        if ($Check) { Say TODO "$name is not set; it would be $value."; return }
+        [Environment]::SetEnvironmentVariable($name, $value, 'User')
+        if ([Environment]::GetEnvironmentVariable($name, 'User') -ne $value) { Say FAIL "Could not set ${name}: Windows did not keep it."; return }
+        Set-Item -Path "env:$name" -Value $value
+        Say FIXED "Set $name to $value."
+    }
+    # Children of $roots holding one of $markers (relative folder paths).
+    function Find-Root($roots, $markers) {
+        @(foreach ($root in $roots) {
+                if (-not $root -or -not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+                foreach ($dir in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
+                    if (@($markers | Where-Object { Test-Path -LiteralPath (Join-Path $dir.FullName $_) -PathType Container }).Count) { $dir.FullName }
+                }
+            }) | Sort-Object -Unique
+    }
 
     # Installed from any source counts: winget also lists Store and preinstalled copies. One list per
-    # app: a single winget export misses some of them.
+    # app: a single winget export misses some of them. A Store or vendor copy winget does not tie to
+    # the id still lists under its name.
     function Test-App($app) {
         if ($app.Command -and (Find-Exe $app.Command)) { return $true }
         $null = winget list --id $app.Id --exact --accept-source-agreements 2>&1
+        if ($LASTEXITCODE -eq 0) { return $true }
+        $null = winget list --name $app.Name --accept-source-agreements 2>&1
         $LASTEXITCODE -eq 0
     }
     function Install-App($app) {
         Note "Installing $($app.Name)..."
-        $out = winget install --id $app.Id --exact --scope $app.Scope --silent --accept-package-agreements --accept-source-agreements 2>&1 |
+        $custom = if ($app.Custom) { '--custom', $app.Custom }
+        $out = winget install --id $app.Id --exact --scope $app.Scope --silent --accept-package-agreements --accept-source-agreements @custom 2>&1 |
             ForEach-Object { "$_".Trim() } | Where-Object { $_.Length -gt 1 -and $_ -notmatch '^[-\\|/ ]+$' }
         Log ($out -join "`n")
         $LASTEXITCODE
@@ -277,11 +326,20 @@ param([switch] $Check, [switch] $MachineOnly)
         }
     }
 
+    # Kept, never upgraded: other software may pin an old version. Missing: its app line says so.
+    $nodeVersion = Get-ToolVersion node
+    if ($nodeVersion -and $nodeVersion -lt [version]'18.0') { Say FAIL "Node.js $nodeVersion is too old: E29 Dataverse needs 18 or newer. Try:  winget install --id OpenJS.NodeJS.LTS --exact" }
+    # The skills call python; fill-travel-distance needs 3.11 (enum.StrEnum).
+    $pythonVersion = Get-ToolVersion python
+    if (-not $pythonVersion) { if (Find-Exe py) { Say TODO 'python opens the Microsoft Store. Turn it off: Settings > Apps > Advanced app settings > App execution aliases > python.exe and python3.exe off. Then paste this again.' } }
+    elseif ($pythonVersion -lt [version]'3.11') { Say TODO "Python $pythonVersion is too old: the E29 skills need 3.11 or newer. Run:  winget install --id Python.Python.3.13 --exact --scope user --custom PrependPath=1" }
+
     # --- 3. Claude ---
     Section '3. Claude'
     $claude = $null
+    $userEmail = $null
     & {
-        # Claude Code: PATH, the native install, or npm - the places setup_e29_plugin.ps1 looks.
+        # Claude Code: PATH, the native install, or npm.
         $claude = @(Find-Exe claude) + @("$userHome\.local\bin\claude.exe", "$env:APPDATA\npm\claude.cmd" | Where-Object { Test-Path $_ }) | Where-Object { $_ } | Select-Object -First 1
         if (-not $claude -and -not $Check) {
             Note "Installing Claude Code with the official installer: $claudeInstallerUrl"
@@ -309,6 +367,24 @@ param([switch] $Check, [switch] $MachineOnly)
         if (-not $claude) { return }
         Set-Variable -Name claude -Value $claude -Scope 1
 
+        # Found outside PATH: new terminals need it there. Written as REG_EXPAND_SZ, which keeps every
+        # %TOKEN% (SetEnvironmentVariable would freeze them; setx cuts at 1024 characters).
+        if (-not (Find-Exe claude) -and $claude -in "$userHome\.local\bin\claude.exe", "$env:APPDATA\npm\claude.cmd") {
+            $claudeDir = Split-Path -Parent $claude
+            if ($Check) { Say TODO "claude is not on PATH ($claudeDir)." }
+            else {
+                try {
+                    $raw = "$((Get-Item -LiteralPath 'HKCU:\Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames'))"
+                    Set-ItemProperty -LiteralPath 'HKCU:\Environment' -Name Path -Value ((@($raw.Split(';') | Where-Object { $_ }) + $claudeDir) -join ';') -Type ExpandString
+                    # Deleting a never-stored dummy makes .NET broadcast the change to new terminals.
+                    [Environment]::SetEnvironmentVariable('E29_SETUP_BROADCAST', $null, 'User')
+                    Update-Path
+                    Say FIXED "Added $claudeDir to PATH. New terminals find claude."
+                }
+                catch { Say FAIL "Could not add $claudeDir to PATH: $($_.Exception.Message)" }
+            }
+        }
+
         # Sign-in: the E29 organisation, with the user:plugins scope the claude.ai plugin sync needs.
         # An old Claude Code gives no readable sign-in and does not sync claude.ai plugins: update it first.
         $auth = Get-Auth
@@ -326,6 +402,7 @@ param([switch] $Check, [switch] $MachineOnly)
             if (Test-E29SignIn $auth -Strict) { Say FIXED "Signed in to Claude as $($auth.email) (E29)." }
             else { Say FAIL "Claude is still not signed in with an E29 account that can download plugins ($($auth.email), $($auth.orgName))."; return }
         }
+        if (Test-E29SignIn $auth -Strict) { Set-Variable -Name userEmail -Value $auth.email -Scope 1 }
 
         $plugins = Get-ClaudeJson plugin list --json
         if ($null -eq $plugins) { Say FAIL "Could not read the Claude plugin list. Run this to see why:  & '$claude' plugin list"; return }
@@ -403,26 +480,6 @@ param([switch] $Check, [switch] $MachineOnly)
             }
         }
 
-        # The e29-core setup check owns the Claude dependencies: Node.js, Python, keyring, NAS
-        # variable, Desktop config, Dataverse connection. Called, never copied.
-        $setup = if ($core.installPath) { Join-Path $core.installPath 'skills\setup-e29-plugin\scripts\setup_e29_plugin.ps1' }
-        if ($setup -and (Test-Path $setup)) {
-            Write-Host "`n--- e29-core setup check ---" -ForegroundColor White
-            # Transcript keeps its colours on screen and lets us count its "still to do" lines.
-            $env:E29_SETUP = $setup
-            $env:E29_LOG = Join-Path $env:TEMP 'e29-setup-check.log'
-            $run = 'Start-Transcript -LiteralPath $env:E29_LOG -Force | Out-Null; & $env:E29_SETUP' + $(if ($Check) { ' -DryRun' }) + '; $code = $LASTEXITCODE; Stop-Transcript | Out-Null; exit $code'
-            & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command $run
-            $code = $LASTEXITCODE
-            $checkLog = @(Get-Content -LiteralPath $env:E29_LOG -Encoding UTF8 -ErrorAction SilentlyContinue)
-            Log ($checkLog -join "`n")
-            Write-Host "--- end of e29-core setup check ---`n" -ForegroundColor White
-            if ($code) { Say FAIL 'The e29-core setup check above found a problem: read its red lines.' }
-            $todo = @($checkLog | Where-Object { $_.StartsWith([string][char]0x23F3) -or $_.StartsWith('[TODO]') }).Count
-            if ($todo) { $state.TODO += $todo }
-        }
-        elseif ($core) { Say TODO 'The e29-core setup check is missing. In Claude Code run /e29-core:setup-e29-plugin' }
-
         # Final check, read back from Claude itself.
         $core = Get-Core
         if ($core -and $core.enabled -and (Get-Major $core.version) -ge 2) { Say OK "e29-core $($core.version) from claude.ai is installed and on." }
@@ -433,11 +490,77 @@ param([switch] $Check, [switch] $MachineOnly)
             Say FAIL "e29-core from claude.ai is $(if ($core) { "version $($core.version)" } else { 'missing' }); it must be 2 or higher."
             Show-SyncInfo $core
         }
+        if (-not ($core -and $core.enabled -and (Get-Major $core.version) -ge 2)) { return }
+
+        # keyring caches the Dataverse sign-in. The package list lives once, in the plugin.
+        $requirements = Join-Path $core.installPath 'skills\e29-dataverse\scripts\requirements.txt'
+        if ($pythonVersion -ge [version]'3.11' -and (Test-Path -LiteralPath $requirements)) {
+            $python = Find-Exe python
+            & $python -c 'import keyring' 2>$null
+            if ($LASTEXITCODE -eq 0) { Say OK 'keyring (Dataverse sign-in cache) is installed.' }
+            elseif ($Check) { Say TODO 'keyring (Dataverse sign-in cache) is not installed.' }
+            else {
+                Log ((& $python -m pip install --user -r $requirements 2>&1 | ForEach-Object { "$_" }) -join "`n")
+                & $python -c 'import keyring' 2>$null
+                if ($LASTEXITCODE -eq 0) { Say FIXED 'Installed keyring (Dataverse sign-in cache).' }
+                else { Say FAIL "Could not install keyring. Try:  python -m pip install --user -r `"$requirements`"" }
+            }
+        }
+
+        # Not connected is fine: the Microsoft sign-in happens on the first Dataverse question.
+        Note 'Checking E29 Dataverse in Claude Code (this checks every connection, so it takes a moment)...'
+        $server = 'plugin:e29-core:E29_Dataverse'
+        $list = Invoke-Timed $claude 'mcp list' 180
+        $line = @("$list" -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_.StartsWith("${server}:") })[0]
+        if ($line -cmatch '\bConnected\b') { Say OK 'E29 Dataverse is connected in Claude Code.' }
+        elseif ($line) { Note "E29 Dataverse is set up; Claude asks for your E29 Microsoft sign-in on first use. ($line)" }
+        elseif ($null -eq $list) { Note 'claude mcp list took over 3 minutes and was stopped; in Claude Code, /mcp shows E29 Dataverse.' Yellow }
+        else { Say TODO 'E29 Dataverse is missing from Claude Code. Restart Claude Code, then paste this again.' }
     }
     Update-Path
 
-    # --- 4. GitHub --- runs even when the Claude step failed: Git and GitHub CLI come from the app list.
-    Section '4. GitHub'
+    # --- 4. Folders --- where the Claude skills find SharePoint, the NAS and repo clones. Set only
+    # when exactly one candidate is found; never guessed.
+    Section '4. Folders'
+    $var = 'E29_SHAREPOINT_ROOT'
+    $have = [Environment]::GetEnvironmentVariable($var, 'User')
+    if ($have -and (Test-Path -LiteralPath $have -PathType Container)) { Say OK "$var is $have." }
+    else {
+        $oneDriveParent = if ($env:OneDriveCommercial) { Split-Path -Parent $env:OneDriveCommercial }
+        $found = @(Find-Root @($userHome, $oneDriveParent) @('Grant - Documents', 'Project - Documents', 'Project - Dissemination', 'Project - Output'))
+        if ($found.Count -eq 1) { Set-UserVariable $var $found[0] }
+        elseif ($found.Count) { Say TODO "$var is not set: several folders look like the E29 SharePoint folder ($($found -join '; ')). Run, with the right one:  [Environment]::SetEnvironmentVariable('$var', '<folder>', 'User')" }
+        else { Say TODO "$var is not set: no E29 SharePoint library is synced to this computer. In SharePoint open Project - Documents, choose Sync, then paste this again." }
+    }
+
+    # A ;-separated list of NAS roots, the folders holding photo\. Off the office network every one
+    # can be down and the value still right.
+    $var = 'E29_NAS_ROOT'
+    $nasDefault = '\\E29HU'
+    $have = [Environment]::GetEnvironmentVariable($var, 'User')
+    $candidates = @("$have" -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    Note "Looking for the office NAS $nasDefault (up to ~20 seconds when it is not reachable)..."
+    # Test-Path on an unreachable UNC host throws instead of returning $false.
+    $reachable = @($candidates) + @($nasDefault | Where-Object { $candidates -notcontains $_ }) |
+        Where-Object { try { Test-Path -LiteralPath (Join-Path $_ 'photo') -PathType Container -ErrorAction Stop } catch { $false } } |
+        Select-Object -First 1
+    if ($reachable -and $candidates -contains $reachable) { Say OK "$var is $have." }
+    elseif ($reachable) { Set-UserVariable $var ((@($nasDefault) + $candidates) -join ';') }
+    elseif ($have) { Say SKIP "$var is $have; the NAS is not reachable from here now." }
+    else { Say SKIP "$var is not set: the office NAS is not reachable from here. Only the NAS photo skills need it." }
+
+    # The user's own clones; without it the skills work in a cache clone.
+    $var = 'E29_GITHUB_REPOS_ROOT'
+    $have = [Environment]::GetEnvironmentVariable($var, 'User')
+    if ($have -and (Test-Path -LiteralPath $have -PathType Container)) { Say OK "$var is $have." }
+    else {
+        $found = @(Find-Root @($userHome, "$userHome\source", [Environment]::GetFolderPath('MyDocuments'), "$env:SystemDrive\") @('e29-websites\.git', 'knowledge-base\.git'))
+        if ($found.Count -eq 1) { Set-UserVariable $var $found[0] }
+        else { Say SKIP "$var is not set: $(if ($found.Count) { "several folders hold E29 repo clones ($($found -join '; '))" } else { 'no E29 repo clone on this computer' }). Optional." }
+    }
+
+    # --- 5. GitHub --- runs even when the Claude step failed: Git and GitHub CLI come from the app list.
+    Section '5. GitHub'
     $gh = Find-Exe gh
     $git = Find-Exe git
     # gh prints the error body on stdout too: only an object with a login is a user.
@@ -491,14 +614,14 @@ param([switch] $Check, [switch] $MachineOnly)
     }
     elseif ($ghUser) { Say FAIL 'Git is missing - see the Apps lines above.' }
 
-    # --- 5. PM plugin --- for whoever can read its private repo; the GitHub team decides who.
+    # --- 6. PM plugin --- for whoever can read its private repo; the GitHub team decides who.
     $pm = $false
     if ($ghUser -and $claude) {
         & $gh api "repos/$pmRepo" --silent 2>$null
         $pm = $LASTEXITCODE -eq 0
     }
     if ($pm) {
-        Section '5. Project management plugin'
+        Section '6. Project management plugin'
         $markets = Get-ClaudeJson plugin marketplace list --json
         if ($null -eq $markets) { Say FAIL "Could not read the Claude marketplace list. Run this to see why:  & '$claude' plugin marketplace list" }
         elseif (@($markets | Where-Object { $_.name -eq 'e29-pm' }).Count) { Say OK 'e29-pm marketplace is added.' }
@@ -560,24 +683,36 @@ param([switch] $Check, [switch] $MachineOnly)
     }
     elseif ($ghUser -and $claude) { Say SKIP 'No extra Claude plugins for your GitHub account.' }
 
-    # --- 6. What is left ---
-    Section 'Still to do by hand (once per computer)'
-    $left = @(
-        "Claude Desktop: Settings > Connectors > Microsoft 365 > Connect, sign in with your E29 Microsoft account. Guide: $kb/getting-started/set-up-your-computer/#connect-microsoft-365",
-        "Photo and video staff only - Synology Drive Client: sync your NAS folders. Guide: $kb/how-to-set-up-tools/synology-drive-sync/",
-        "Bitwarden app and browser extension: server https://vault.e29.eu/ then sign in. Guide: $kb/getting-started/set-up-your-computer/#set-up-bitwarden"
-    )
-    if ($pm) { $left += "Project management keys (Odoo, Fio, EU Login) into keyring: https://github.com/$pmRepo#readme" }
-    $n = 0
-    foreach ($line in $left) { $n++; Write-Host "  $n. $line"; Log "  $n. $line" }
-
-    # --- 7. Summary ---
+    # --- 6. Summary --- the manual steps after this live in the knowledge base, not here.
     Section 'Summary'
     $summary = 'OK {0}  FIXED {1}  SKIP {2}  TODO {3}  FAIL {4}' -f $state.OK, $state.FIXED, $state.SKIP, $state.TODO, $state.FAIL
     Write-Host "  $summary"; Log "  $summary"
+
+    # The log goes to Attila. The first line is what the check's keyword filter reads: result and
+    # E29 Microsoft 365 domain, from the E29 Claude sign-in or the Windows work account.
+    $reported = $false
+    if (-not $userEmail) { $userEmail = "$(whoami /upn 2>$null)".Trim() }
+    if ($logUrl -and $userEmail -match '@([\w.-]+)$') {
+        $marker = "[e29-setup $(if ($state.FAIL) { 'FAIL' } else { 'OK' })@$($Matches[1].ToLower())]"
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            $body = [Text.Encoding]::UTF8.GetBytes("$marker`n$([IO.File]::ReadAllText($logPath))")
+            $null = Invoke-WebRequest -Uri $logUrl -Method Post -Body $body -ContentType 'text/plain; charset=utf-8' -UseBasicParsing -TimeoutSec 20
+            $reported = $true
+        }
+        catch { }
+    }
+    if ($state.FAIL -and $reported) {
+        Write-Host "`n$($state.FAIL) problem(s) above. Attila has the log and will follow up." -ForegroundColor Red
+        return
+    }
+    if ($state.FAIL) {
+        Write-Host "`n$($state.FAIL) problem(s) above. Send Attila a screenshot of this window and this file:" -ForegroundColor Red
+        Write-Host "  $logPath  " -ForegroundColor White -BackgroundColor DarkRed
+        return
+    }
     Write-Host "  Full log: $logPath" -ForegroundColor Gray
-    if ($state.FAIL) { Write-Host "`n$($state.FAIL) problem(s) above. Send a screenshot of this window and the log file to Attila." -ForegroundColor Red }
-    elseif ($state.TODO) { Write-Host "`nAlmost done: do the yellow [TODO] lines, then paste this again." -ForegroundColor Yellow }
+    if ($state.TODO) { Write-Host "`nAlmost done: do the yellow [TODO] lines, then paste this again." -ForegroundColor Yellow }
     elseif ($Check) { Write-Host "`nAll set: nothing to change." -ForegroundColor Green }
-    else { Write-Host "`nAll done. Do the steps under 'Still to do by hand', then start Claude." -ForegroundColor Green }
+    else { Write-Host "`nAll done. Go back to the guide: $kb/getting-started/set-up-your-computer/#connect-to-systems" -ForegroundColor Green }
 }
