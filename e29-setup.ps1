@@ -519,6 +519,36 @@ param([switch] $Check, [switch] $MachineOnly)
     }
     Update-Path
 
+    # Claude Desktop gets E29 Dataverse from the synced plugin and hands every config server to its
+    # Code tab, so the 'E29 Dataverse' entry old installers wrote doubles every Dataverse tool.
+    # ceiling: pinned to Anthropic's MSIX package family name; a re-signed package needs it updated.
+    $desktopConfigs = "$env:LOCALAPPDATA\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude_desktop_config.json", "$env:APPDATA\Claude\claude_desktop_config.json"
+    foreach ($desktopConfig in @($desktopConfigs | Where-Object { Test-Path -LiteralPath $_ })) {
+        try {
+            $config = [IO.File]::ReadAllText($desktopConfig) | ConvertFrom-Json -ErrorAction Stop
+            $servers = if ($config) { $config.mcpServers }
+            $names = @(if ($servers) { $servers.PSObject.Properties.Name })
+            $old = $names | Where-Object { $_ -eq 'E29 Dataverse' } | Select-Object -First 1
+            $others = @($names | Where-Object { $_ -ne 'E29 Dataverse' -and ($servers.$_ | ConvertTo-Json -Depth 20 -Compress) -match '@microsoft/dataverse' })
+            if (-not $old) { Say OK "No old E29 Dataverse entry in $desktopConfig." }
+            elseif ($Check) { Say TODO "$desktopConfig still has the old E29 Dataverse entry; it doubles every Dataverse tool." }
+            else {
+                $servers.PSObject.Properties.Remove($old)
+                $new = $config | ConvertTo-Json -Depth 100
+                # Never write a file that lost anything but that one entry.
+                $back = $new | ConvertFrom-Json -ErrorAction Stop
+                if ((@($back.PSObject.Properties.Name) -join '|') -ne (@($config.PSObject.Properties.Name) -join '|') -or
+                    (@($back.mcpServers.PSObject.Properties.Name) -join '|') -ne (@($names | Where-Object { $_ -ne $old }) -join '|')) { throw 'the rewritten file does not read back the same.' }
+                $backup = "$desktopConfig.$(Get-Date -Format yyyyMMdd-HHmmss).bak"
+                Copy-Item -LiteralPath $desktopConfig -Destination $backup
+                [IO.File]::WriteAllText($desktopConfig, $new, (New-Object Text.UTF8Encoding $false))
+                Say FIXED "Removed the old E29 Dataverse entry from $desktopConfig (backup: $backup). Restart Claude Desktop."
+            }
+            if ($others.Count) { Say TODO "$desktopConfig has other Dataverse entries: $($others -join ', '). One for e29.crm4.dynamics.com doubles every Dataverse tool; delete it by hand." }
+        }
+        catch { Say FAIL "Could not clean up $desktopConfig; nothing written: $($_.Exception.Message)" }
+    }
+
     # --- 4. Folders --- where the Claude skills find SharePoint, the NAS and repo clones. Set only
     # when exactly one candidate is found; never guessed.
     Section '4. Folders'
