@@ -138,6 +138,20 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
         $LASTEXITCODE
     }
     function Get-InstallHint($app) { "winget install --id $($app.Id) --exact --scope $($app.Scope)" }
+    # Installed version from winget: the token after the id (column headers are translated). A copy
+    # winget does not tie to the id: the file version of its command. $null = unknown.
+    function Get-AppVersion($app) {
+        foreach ($line in @(winget list --id $app.Id --exact --accept-source-agreements 2>&1)) {
+            $t = @("$line".Trim() -split '\s+')
+            for ($i = 0; $i -lt $t.Count - 1; $i++) {
+                if ($t[$i] -ne $app.Id) { continue }
+                # winget writes "< 1.2" when the installer reports only a range.
+                if ($t[$i + 1] -in '<', '>' -and $i + 2 -lt $t.Count) { return "$($t[$i + 1]) $($t[$i + 2])" }
+                return $t[$i + 1]
+            }
+        }
+        if ($app.Command -and ($exe = Find-Exe $app.Command) -and $exe -like '*.exe') { (Get-Item -LiteralPath $exe).VersionInfo.ProductVersion }
+    }
 
     # --- Policies --- only an admin can write them, the user's own policy key too. The elevated copy
     # writes that key by the user's SID, so it lands on the right user whichever admin approves.
@@ -929,6 +943,23 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
             Say FIXED "Scheduled task '$taskName' runs the check every Monday at 10:00."
         }
         catch { Say FAIL "Could not schedule the weekly check: $($_.Exception.Message)" }
+    }
+
+    # --- Versions --- log only, for the telemetry: what each laptop runs after this run. Reads only.
+    Log "`n== Versions"
+    foreach ($app in $Apps) {
+        $version = Get-AppVersion $app
+        Log "       App: $($app.Name) $(if ($version) { $version } else { 'unknown' })"
+    }
+    if ($claude) {
+        Log "       App: Claude Code $(if ("$(& $claude --version 2>$null)" -match '\d+\.\d+\S*') { $Matches[0] } else { 'unknown' })"
+        # foreach, not a pipe: Get-ClaudeJson returns the list as one item. The same plugin in several
+        # projects is one line.
+        $pluginLines = foreach ($p in (Get-ClaudeJson plugin list --json)) { "       Plugin: $($p.id) $($p.version), $(if ($p.enabled) { 'on' } else { 'off' }), $($p.scope) scope" }
+        $pluginLines | Sort-Object -Unique | ForEach-Object { Log $_ }
+    }
+    if ($vscode) {
+        foreach ($e in @(& $vscode --list-extensions --show-versions 2>$null | Where-Object { "$_" -like "$extension@*" })) { Log "       Extension: VS Code $("$e".Replace('@', ' '))" }
     }
 
     # --- 7. Summary --- the manual steps after this live in the knowledge base, not here.
