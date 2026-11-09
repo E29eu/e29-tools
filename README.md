@@ -19,6 +19,10 @@ extensions. The library list is the `$Libraries` table at the top of the script.
 also posts it to the healthchecks.io check `e29-setup`, which keeps only logs from E29 Microsoft 365
 domains.
 
+It also registers the scheduled task `E29 setup check`, in the user's own context: every Monday at
+10:00 (or at the next logon after a missed run) it runs the latest script with `-Check`, hidden,
+and posts that log too. To stop it: `Unregister-ScheduledTask -TaskName 'E29 setup check'`.
+
 Open PowerShell (not as administrator), then run:
 
 ```powershell

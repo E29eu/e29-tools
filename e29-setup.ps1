@@ -42,6 +42,8 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
 
     $ErrorActionPreference = 'Continue'
     $state = @{ OK = 0; FIXED = 0; SKIP = 0; TODO = 0; FAIL = 0 }
+    # TODO and FAIL lines, repeated under the summary so nothing scrolls out of sight.
+    $openItems = [Collections.Generic.List[object]]::new()
     $logPath = Join-Path $env:TEMP 'e29-setup.log'
     # Claude Code resolves ~ to %USERPROFILE%; 5.1's $HOME differs on a redirected profile.
     $userHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
@@ -67,6 +69,7 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
     function Say($tag, $msg) {
         $state[$tag]++
         $color = @{ OK = 'Green'; FIXED = 'Green'; SKIP = 'Gray'; TODO = 'Yellow'; FAIL = 'Red' }[$tag]
+        if ($tag -in 'TODO', 'FAIL') { $openItems.Add(@{ Text = ('[{0}] {1}' -f $tag, $msg); Color = $color }) }
         Write-Host ('[{0}] {1}' -f $tag, $msg) -ForegroundColor $color
         Log "[$tag] $msg"
     }
@@ -726,7 +729,16 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
     # OneDrive signed in to E29, and the libraries the policies mount kept on this computer
     # ("Always keep on this device"). The policy mounts them online-only.
     $oneDrive = @(Get-ItemProperty 'HKCU:\Software\Microsoft\OneDrive\Accounts\Business*' -ErrorAction SilentlyContinue | Where-Object { $_.ConfiguredTenantId -eq $tenantId })
-    if ($oneDrive.Count) { Say OK "OneDrive is signed in as $($oneDrive[0].UserEmail)." }
+    if ($oneDrive.Count) {
+        Say OK "OneDrive is signed in as $($oneDrive[0].UserEmail)."
+        # Every synced SharePoint library: each Tenants\<name> value is a local folder; the user's own OneDrive left out.
+        $synced = @(@(foreach ($account in $oneDrive) {
+                    Get-ChildItem (Join-Path $account.PSPath 'Tenants') -ErrorAction SilentlyContinue |
+                        ForEach-Object { $_.GetValueNames() } | Where-Object { $_ -and $_ -ne $account.UserFolder }
+                }) | Sort-Object -Unique)
+        if ($synced.Count) { foreach ($path in $synced) { Note "Synced library: $path" } }
+        else { Note 'Synced library: none.' }
+    }
     else { Say TODO 'OneDrive is not signed in with your E29 account. Open OneDrive from the Start menu and sign in with your @e29.eu address.' }
     $spRoot = [Environment]::GetEnvironmentVariable($var, 'User')
     foreach ($lib in @(Get-Library $grantAccess)) {
@@ -898,10 +910,34 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
     }
     elseif ($ghUser -and $claude) { Say SKIP 'No extra Claude plugins for your GitHub account.' }
 
-    # --- 6. Summary --- the manual steps after this live in the knowledge base, not here.
+    # --- 6. Weekly check --- a task in the user's own context runs the latest script with -Check
+    # every Monday, so the log keeps arriving. -Check never elevates or waits for input; -NonInteractive
+    # makes any prompt fail instead of hang. Missed runs (computer off) start at the next logon.
+    Section '6. Weekly check'
+    $taskName = 'E29 setup check'
+    $taskArgs = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"& ([scriptblock]::Create((irm https://raw.githubusercontent.com/E29eu/e29-tools/main/e29-setup.ps1))) -Check`""
+    $task = Get-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction SilentlyContinue
+    if ($task -and $task.Actions[0].Arguments -eq $taskArgs) { Say OK "Scheduled task '$taskName' runs the check weekly." }
+    elseif ($Check) { Say TODO "Scheduled task '$taskName' is $(if ($task) { 'out of date' } else { 'missing' }). Paste the setup again." }
+    else {
+        try {
+            # No principal: Task Scheduler runs it as this user, only while signed in, no admin rights needed.
+            $null = Register-ScheduledTask -TaskName $taskName -TaskPath '\' -Force -ErrorAction Stop `
+                -Description 'Runs e29-setup.ps1 -Check weekly; changes nothing, posts the log to E29 IT.' `
+                -Action (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $taskArgs) `
+                -Trigger (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At '10:00') `
+                -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -RunOnlyIfNetworkAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 30))
+            Say FIXED "Scheduled task '$taskName' runs the check every Monday at 10:00."
+        }
+        catch { Say FAIL "Could not schedule the weekly check: $($_.Exception.Message)" }
+    }
+
+    # --- 7. Summary --- the manual steps after this live in the knowledge base, not here.
     Section 'Summary'
     $summary = 'OK {0}  FIXED {1}  SKIP {2}  TODO {3}  FAIL {4}' -f $state.OK, $state.FIXED, $state.SKIP, $state.TODO, $state.FAIL
     Write-Host "  $summary"; Log "  $summary"
+    # Indented: the telemetry parser counts only [TODO]/[FAIL] at line start, so these are not doubled.
+    foreach ($item in $openItems) { Write-Host "  $($item.Text)" -ForegroundColor $item.Color; Log "  $($item.Text)" }
 
     # The log goes to Attila. The first line is what the check's keyword filter reads: result and
     # E29 Microsoft 365 domain, from the E29 Claude sign-in or the Windows work account.
