@@ -377,6 +377,8 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
     $bitlockerText = if ($null -ne $bitlocker) { @{ 0 = 'not supported'; 1 = 'on'; 2 = 'off'; 3 = 'encrypting'; 4 = 'decrypting'; 5 = 'suspended'; 6 = 'on'; 8 = 'waiting for activation' }[[int]$bitlocker] }
     if ($null -eq $bitlocker) { Note 'Could not read the disk encryption state.' }
     elseif ($bitlocker -in 1, 3, 6) { Say OK "Disk encryption (BitLocker) on $env:SystemDrive is $bitlockerText." }
+    # Joined and enrolled: the Intune BitLocker policy encrypts silently and keeps the key in Entra.
+    elseif ($mdm.Count -and $dsreg -match 'AzureAdJoined : YES') { Say TODO "Disk encryption (BitLocker) on $env:SystemDrive is $(if ($bitlockerText) { $bitlockerText } else { "in state $bitlocker" }). Intune turns it on by itself and keeps the recovery key: restart the laptop, wait a day, then paste this again. Still not on: ask Attila." }
     else { Say TODO "Disk encryption (BitLocker) on $env:SystemDrive is $(if ($bitlockerText) { $bitlockerText } else { "in state $bitlocker" }). Turn it on: Settings > Privacy & security > Device encryption; on Windows Pro search BitLocker and choose Turn on BitLocker. Save the recovery key in Bitwarden." }
 
     # Every product Windows Security knows: Bitdefender turns Microsoft Defender off.
