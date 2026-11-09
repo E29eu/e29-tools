@@ -55,9 +55,7 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
     $pmRepo = 'E29eu/claude-e29-pm-plugin'
     $claudeInstallerUrl = 'https://claude.ai/install.ps1'
     $kb = 'https://kb.e29.eu'
-    # healthchecks.io check e29-setup (project E29) receives every log. It keeps only a log whose
-    # first line names an E29 Microsoft 365 domain with users (HTTP body keyword filter); anything
-    # else is ignored. A new staff domain goes into the check's success and failure keywords.
+    # Every log is posted here.
     $logUrl = 'https://hc-ping.com/a9cddf4c-a6a4-4e63-9ce3-20f1bec8e5d0'
 
     # The whole script text, for the elevated copy: `irm | iex` leaves no file to start again.
@@ -333,8 +331,7 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
     }
     Say OK "Windows $([Environment]::OSVersion.Version.Build), winget $((winget --version) -join '')."
 
-    # Inventory, for the log Attila reconciles with the Assets table (serial number), Entra and
-    # Intune (device name, device id, MAC addresses). Reads only, no admin rights needed.
+    # Device inventory for the log. Reads only, no admin rights needed.
     function Get-Safe($block) { try { & $block } catch { } }
     $cs = Get-Safe { Get-CimInstance Win32_ComputerSystem -ErrorAction Stop }
     $bios = Get-Safe { Get-CimInstance Win32_BIOS -ErrorAction Stop }
@@ -939,8 +936,7 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
     # Indented: the telemetry parser counts only [TODO]/[FAIL] at line start, so these are not doubled.
     foreach ($item in $openItems) { Write-Host "  $($item.Text)" -ForegroundColor $item.Color; Log "  $($item.Text)" }
 
-    # The log goes to Attila. The first line is what the check's keyword filter reads: result and
-    # E29 Microsoft 365 domain, from the E29 Claude sign-in or the Windows work account.
+    # First line: result and the user's Microsoft 365 domain, from the Claude sign-in or the Windows work account.
     $reported = $false
     if (-not $userEmail) { $userEmail = "$(whoami /upn 2>$null)".Trim() }
     if ($logUrl -and $userEmail -match '@([\w.-]+)$') {
