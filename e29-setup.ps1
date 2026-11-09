@@ -42,6 +42,8 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
 
     $ErrorActionPreference = 'Continue'
     $state = @{ OK = 0; FIXED = 0; SKIP = 0; TODO = 0; FAIL = 0 }
+    # TODO and FAIL lines, repeated under the summary so nothing scrolls out of sight.
+    $openItems = [Collections.Generic.List[object]]::new()
     $logPath = Join-Path $env:TEMP 'e29-setup.log'
     # Claude Code resolves ~ to %USERPROFILE%; 5.1's $HOME differs on a redirected profile.
     $userHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
@@ -67,6 +69,7 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
     function Say($tag, $msg) {
         $state[$tag]++
         $color = @{ OK = 'Green'; FIXED = 'Green'; SKIP = 'Gray'; TODO = 'Yellow'; FAIL = 'Red' }[$tag]
+        if ($tag -in 'TODO', 'FAIL') { $openItems.Add(@{ Text = ('[{0}] {1}' -f $tag, $msg); Color = $color }) }
         Write-Host ('[{0}] {1}' -f $tag, $msg) -ForegroundColor $color
         Log "[$tag] $msg"
     }
@@ -726,7 +729,16 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
     # OneDrive signed in to E29, and the libraries the policies mount kept on this computer
     # ("Always keep on this device"). The policy mounts them online-only.
     $oneDrive = @(Get-ItemProperty 'HKCU:\Software\Microsoft\OneDrive\Accounts\Business*' -ErrorAction SilentlyContinue | Where-Object { $_.ConfiguredTenantId -eq $tenantId })
-    if ($oneDrive.Count) { Say OK "OneDrive is signed in as $($oneDrive[0].UserEmail)." }
+    if ($oneDrive.Count) {
+        Say OK "OneDrive is signed in as $($oneDrive[0].UserEmail)."
+        # Every synced SharePoint library: each Tenants\<name> value is a local folder; the user's own OneDrive left out.
+        $synced = @(@(foreach ($account in $oneDrive) {
+                    Get-ChildItem (Join-Path $account.PSPath 'Tenants') -ErrorAction SilentlyContinue |
+                        ForEach-Object { $_.GetValueNames() } | Where-Object { $_ -and $_ -ne $account.UserFolder }
+                }) | Sort-Object -Unique)
+        if ($synced.Count) { foreach ($path in $synced) { Note "Synced library: $path" } }
+        else { Note 'Synced library: none.' }
+    }
     else { Say TODO 'OneDrive is not signed in with your E29 account. Open OneDrive from the Start menu and sign in with your @e29.eu address.' }
     $spRoot = [Environment]::GetEnvironmentVariable($var, 'User')
     foreach ($lib in @(Get-Library $grantAccess)) {
@@ -902,6 +914,8 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
     Section 'Summary'
     $summary = 'OK {0}  FIXED {1}  SKIP {2}  TODO {3}  FAIL {4}' -f $state.OK, $state.FIXED, $state.SKIP, $state.TODO, $state.FAIL
     Write-Host "  $summary"; Log "  $summary"
+    # Indented: the telemetry parser counts only [TODO]/[FAIL] at line start, so these are not doubled.
+    foreach ($item in $openItems) { Write-Host "  $($item.Text)" -ForegroundColor $item.Color; Log "  $($item.Text)" }
 
     # The log goes to Attila. The first line is what the check's keyword filter reads: result and
     # E29 Microsoft 365 domain, from the E29 Claude sign-in or the Windows work account.
