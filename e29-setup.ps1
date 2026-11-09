@@ -910,7 +910,29 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
     }
     elseif ($ghUser -and $claude) { Say SKIP 'No extra Claude plugins for your GitHub account.' }
 
-    # --- 6. Summary --- the manual steps after this live in the knowledge base, not here.
+    # --- 6. Weekly check --- a task in the user's own context runs the latest script with -Check
+    # every Monday, so the log keeps arriving. -Check never elevates or waits for input; -NonInteractive
+    # makes any prompt fail instead of hang. Missed runs (computer off) start at the next logon.
+    Section '6. Weekly check'
+    $taskName = 'E29 setup check'
+    $taskArgs = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"& ([scriptblock]::Create((irm https://raw.githubusercontent.com/E29eu/e29-tools/main/e29-setup.ps1))) -Check`""
+    $task = Get-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction SilentlyContinue
+    if ($task -and $task.Actions[0].Arguments -eq $taskArgs) { Say OK "Scheduled task '$taskName' runs the check weekly." }
+    elseif ($Check) { Say TODO "Scheduled task '$taskName' is $(if ($task) { 'out of date' } else { 'missing' }). Paste the setup again." }
+    else {
+        try {
+            # No principal: Task Scheduler runs it as this user, only while signed in, no admin rights needed.
+            $null = Register-ScheduledTask -TaskName $taskName -TaskPath '\' -Force -ErrorAction Stop `
+                -Description 'Runs e29-setup.ps1 -Check weekly; changes nothing, posts the log to E29 IT.' `
+                -Action (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $taskArgs) `
+                -Trigger (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At '10:00') `
+                -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -RunOnlyIfNetworkAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 30))
+            Say FIXED "Scheduled task '$taskName' runs the check every Monday at 10:00."
+        }
+        catch { Say FAIL "Could not schedule the weekly check: $($_.Exception.Message)" }
+    }
+
+    # --- 7. Summary --- the manual steps after this live in the knowledge base, not here.
     Section 'Summary'
     $summary = 'OK {0}  FIXED {1}  SKIP {2}  TODO {3}  FAIL {4}' -f $state.OK, $state.FIXED, $state.SKIP, $state.TODO, $state.FAIL
     Write-Host "  $summary"; Log "  $summary"
