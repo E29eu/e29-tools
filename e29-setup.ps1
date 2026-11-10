@@ -930,6 +930,37 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
             }
         }
         catch { Say FAIL "$settingsPath is missing or does not parse; nothing written: $($_.Exception.Message)" }
+
+        # CLI for Microsoft 365: e29-pm posts to Teams with it. It signs in as the user through the
+        # E29 app `CLI for M365`, assigned to Full-time Team Member SG. 12+: the sign-in is kept
+        # encrypted (DPAPI); 11 kept it in a plain file.
+        function Get-M365Major { $m = Find-Exe m365; if ($m -and "$(& $m version 2>$null)" -match '(\d+)\.') { [int]$Matches[1] } else { 0 } }
+        $m365Major = Get-M365Major
+        $m365Hint = "npm install -g '@pnp/cli-microsoft365@latest'"
+        if ($m365Major -ge 12) { Say OK 'CLI for Microsoft 365 is installed.' }
+        elseif ($Check) { Say TODO $(if ($m365Major) { "CLI for Microsoft 365 $m365Major is too old: it needs 12 or newer." } else { 'CLI for Microsoft 365 is not installed.' }) }
+        elseif (-not ($npm = Find-Exe npm)) { Say FAIL 'Cannot install CLI for Microsoft 365: npm is missing - see the Node.js line above.' }
+        else {
+            Note 'Installing CLI for Microsoft 365...'
+            Log ((& $npm install -g '@pnp/cli-microsoft365@latest' 2>&1 | ForEach-Object { "$_" }) -join "`n")
+            Update-Path
+            $m365Major = Get-M365Major
+            if ($m365Major -ge 12) { Say FIXED 'Installed CLI for Microsoft 365.' } else { Say FAIL "Could not install CLI for Microsoft 365. Try:  $m365Hint" }
+        }
+        if ($m365Major -ge 12) {
+            $m365 = Find-Exe m365
+            function Get-M365User { try { ((& $m365 status --output json 2>$null) -join "`n" | ConvertFrom-Json -ErrorAction Stop).connectedAs } catch { } }
+            $m365User = Get-M365User
+            if ($m365User) { Say OK "Signed in to CLI for Microsoft 365 as $m365User." }
+            elseif ($Check) { Say TODO 'Not signed in to CLI for Microsoft 365.' }
+            else {
+                Note 'Sign in to Microsoft 365 with your work account in the browser that opens.' Yellow
+                & $m365 login --authType browser --appId '74eff717-91c1-49a1-ba81-d3bc8e1d7c57' --tenant $tenantId
+                $m365User = Get-M365User
+                if ($m365User) { Say FIXED "Signed in to CLI for Microsoft 365 as $m365User." }
+                else { Say FAIL 'CLI for Microsoft 365 sign-in did not finish. Paste this again to retry; if the browser said you are not assigned to the app, ask Attila.' }
+            }
+        }
     }
     elseif ($ghUser -and $claude) { Say SKIP 'No extra Claude plugins for your GitHub account.' }
 
@@ -968,6 +999,7 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
         $pluginLines = foreach ($p in (Get-ClaudeJson plugin list --json)) { "       Plugin: $($p.id) $($p.version), $(if ($p.enabled) { 'on' } else { 'off' }), $($p.scope) scope" }
         $pluginLines | Sort-Object -Unique | ForEach-Object { Log $_ }
     }
+    if ($m365 = Find-Exe m365) { Log "       App: CLI for Microsoft 365 $("$(& $m365 version 2>$null)".Trim().Trim('"'))" }
     if ($vscode) {
         foreach ($e in @(& $vscode --list-extensions --show-versions 2>$null | Where-Object { "$_" -like "$extension@*" })) { Log "       Extension: VS Code $("$e".Replace('@', ' '))" }
     }
