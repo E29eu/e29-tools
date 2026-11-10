@@ -387,13 +387,21 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
     # Posture: read only in both modes; each TODO says what the user fixes.
     # Shell values: 1 on, 2 off, 3 encrypting, 4 decrypting, 5 suspended, 6 on and locked, 8 waiting
     # for activation. Win32_EncryptableVolume needs admin rights; this does not.
-    $bitlocker = Get-Safe { (New-Object -ComObject Shell.Application).NameSpace("$env:SystemDrive\").Self.ExtendedProperty('System.Volume.BitLockerProtection') }
-    $bitlockerText = if ($null -ne $bitlocker) { @{ 0 = 'not supported'; 1 = 'on'; 2 = 'off'; 3 = 'encrypting'; 4 = 'decrypting'; 5 = 'suspended'; 6 = 'on'; 8 = 'waiting for activation' }[[int]$bitlocker] }
-    if ($null -eq $bitlocker) { Note 'Could not read the disk encryption state.' }
-    elseif ($bitlocker -in 1, 3, 6) { Say OK "Disk encryption (BitLocker) on $env:SystemDrive is $bitlockerText." }
-    # Joined and enrolled: the Intune BitLocker policy encrypts silently and keeps the key in Entra.
-    elseif ($mdm.Count -and $dsreg -match 'AzureAdJoined : YES') { Say TODO "Disk encryption (BitLocker) on $env:SystemDrive is $(if ($bitlockerText) { $bitlockerText } else { "in state $bitlocker" }). Intune turns it on by itself and keeps the recovery key: restart the laptop, wait a day, then paste this again. Still not on: ask Attila." }
-    else { Say TODO "Disk encryption (BitLocker) on $env:SystemDrive is $(if ($bitlockerText) { $bitlockerText } else { "in state $bitlocker" }). Turn it on: Settings > Privacy & security > Device encryption; on Windows Pro search BitLocker and choose Turn on BitLocker. Save the recovery key in Bitwarden." }
+    # Every fixed drive with a letter, system drive first: a second SSD holds data too.
+    $drives = @(Get-Safe { [IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady -and $_.TotalSize } } |
+        Sort-Object { $_.Name -ne "$env:SystemDrive\" }, Name)
+    $shell = Get-Safe { New-Object -ComObject Shell.Application }
+    foreach ($drive in $drives) {
+        $letter = $drive.Name.TrimEnd('\')
+        $bitlocker = Get-Safe { $shell.NameSpace($drive.Name).Self.ExtendedProperty('System.Volume.BitLockerProtection') }
+        $bitlockerText = if ($null -ne $bitlocker) { @{ 0 = 'not supported'; 1 = 'on'; 2 = 'off'; 3 = 'encrypting'; 4 = 'decrypting'; 5 = 'suspended'; 6 = 'on'; 8 = 'waiting for activation' }[[int]$bitlocker] }
+        if (-not $bitlockerText) { $bitlockerText = "in state $bitlocker" }
+        if ($null -eq $bitlocker) { Note "Could not read the disk encryption state of $letter." }
+        elseif ($bitlocker -in 1, 3, 6) { Say OK "Disk encryption (BitLocker) on $letter is $bitlockerText." }
+        # Joined and enrolled: the Intune BitLocker policy encrypts silently and keeps the key in Entra.
+        elseif ($mdm.Count -and $dsreg -match 'AzureAdJoined : YES') { Say TODO "Disk encryption (BitLocker) on $letter is $bitlockerText. Intune turns it on by itself and keeps the recovery key: restart the laptop, wait a day, then paste this again. Still not on: ask Attila." }
+        else { Say TODO "Disk encryption (BitLocker) on $letter is $bitlockerText. Turn it on: Settings > Privacy & security > Device encryption; on Windows Pro search BitLocker and choose Turn on BitLocker next to $letter. Save the recovery key in Bitwarden." }
+    }
 
     # Every product Windows Security knows: Bitdefender turns Microsoft Defender off.
     # productState: 0x1000 = on, 0x10 = definitions out of date.
@@ -413,10 +421,12 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
     }
     else { Note 'Could not read the last Windows update.' }
 
-    $sysDrive = Get-Safe { [IO.DriveInfo]::new($env:SystemDrive) }
-    if ($sysDrive.TotalSize) {
-        $text = '{0} has {1:N0} GB free of {2:N0} GB ({3:P0}).' -f $env:SystemDrive, ($sysDrive.AvailableFreeSpace / 1GB), ($sysDrive.TotalSize / 1GB), ($sysDrive.AvailableFreeSpace / $sysDrive.TotalSize)
-        if ($sysDrive.AvailableFreeSpace / $sysDrive.TotalSize -ge 0.1) { Say OK $text } else { Say TODO "$text Free up space: Settings > System > Storage > Cleanup recommendations." }
+    foreach ($drive in $drives) {
+        $letter = $drive.Name.TrimEnd('\')
+        $text = '{0} has {1:N0} GB free of {2:N0} GB ({3:P0}).' -f $letter, ($drive.AvailableFreeSpace / 1GB), ($drive.TotalSize / 1GB), ($drive.AvailableFreeSpace / $drive.TotalSize)
+        if ($drive.AvailableFreeSpace / $drive.TotalSize -ge 0.1) { Say OK $text }
+        elseif ($letter -eq $env:SystemDrive) { Say TODO "$text Free up space: Settings > System > Storage > Cleanup recommendations." }
+        else { Say TODO "$text Free up space: move or delete files on $letter." }
     }
 
     # --- 2. Apps ---
