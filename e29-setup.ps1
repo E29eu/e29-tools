@@ -519,6 +519,25 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
     $pythonVersion = Get-ToolVersion python
     if (-not $pythonVersion) { if (Find-Exe py) { Say TODO 'python opens the Microsoft Store. Turn it off: Settings > Apps > Advanced app settings > App execution aliases > python.exe and python3.exe off. Then paste this again.' } }
     elseif ($pythonVersion -lt [version]'3.11') { Say TODO "Python $pythonVersion is too old: the E29 skills need 3.11 or newer. Run:  winget install --id Python.Python.3.13 --exact --scope user --custom PrependPath=1" }
+    # Packages that 3 or more skills across e29-core and e29-pm import; keyring keeps the Dataverse
+    # and Odoo sign-ins. Any other package: the skill names it on first use. Presence only, never upgraded.
+    $packages = 'keyring', 'PyMuPDF', 'Pillow', 'openpyxl', 'playwright'
+    if ($pythonVersion -ge [version]'3.11' -and ($python = Find-Exe python)) {
+        # No double quotes: Windows PowerShell 5.1 strips them from native arguments.
+        $probe = 'import sys, re, importlib.metadata as m; n = lambda s: re.sub(r''[-_.]+'', ''-'', s).lower(); have = {n(str(d.name)) for d in m.distributions()}; print('' ''.join(a for a in sys.argv[1:] if n(a) not in have))'
+        $getMissing = { $out = & $python -c $probe @packages 2>$null; if ($LASTEXITCODE -eq 0) { , @("$out".Trim() -split ' ' | Where-Object { $_ }) } }
+        $missing = & $getMissing
+        if ($null -eq $missing) { Say FAIL "Could not check the Python packages with $python." }
+        elseif (-not $missing.Count) { Say OK "Python packages are installed: $($packages -join ', ')." }
+        elseif ($Check) { Say TODO "Python packages are missing: $($missing -join ', ')." }
+        else {
+            Note "Installing Python packages: $($missing -join ', ')..."
+            Log ((& $python -m pip install --user --disable-pip-version-check @missing 2>&1 | ForEach-Object { "$_" }) -join "`n")
+            $missing = & $getMissing
+            if ($null -ne $missing -and -not $missing.Count) { Say FIXED 'Installed the Python packages.' }
+            else { Say FAIL "Could not install the Python packages$(if ($missing.Count) { " ($($missing -join ', '))" }). Try:  python -m pip install --user $($packages -join ' ')" }
+        }
+    }
 
     # --- 3. Claude ---
     Section '3. Claude'
@@ -677,21 +696,6 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
             Show-SyncInfo $core
         }
         if (-not ($core -and $core.enabled -and (Get-Major $core.version) -ge 2)) { return }
-
-        # keyring caches the Dataverse sign-in. The package list lives once, in the plugin.
-        $requirements = Join-Path $core.installPath 'skills\e29-dataverse\scripts\requirements.txt'
-        if ($pythonVersion -ge [version]'3.11' -and (Test-Path -LiteralPath $requirements)) {
-            $python = Find-Exe python
-            & $python -c 'import keyring' 2>$null
-            if ($LASTEXITCODE -eq 0) { Say OK 'keyring (Dataverse sign-in cache) is installed.' }
-            elseif ($Check) { Say TODO 'keyring (Dataverse sign-in cache) is not installed.' }
-            else {
-                Log ((& $python -m pip install --user -r $requirements 2>&1 | ForEach-Object { "$_" }) -join "`n")
-                & $python -c 'import keyring' 2>$null
-                if ($LASTEXITCODE -eq 0) { Say FIXED 'Installed keyring (Dataverse sign-in cache).' }
-                else { Say FAIL "Could not install keyring. Try:  python -m pip install --user -r `"$requirements`"" }
-            }
-        }
 
         # Not connected is fine: the Microsoft sign-in happens on the first Dataverse question.
         Note 'Checking E29 Dataverse in Claude Code (this checks every connection, so it takes a moment)...'
