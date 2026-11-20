@@ -868,17 +868,19 @@ param([switch] $Check, [switch] $MachineOnly, [string] $UserSid, [switch] $Grant
             if ($LASTEXITCODE -eq 0) { Say FIXED 'git now uses the GitHub sign-in.' } else { Say FAIL 'gh auth setup-git failed.' }
         }
 
-        # Set only when empty; an existing value is the user's choice. The noreply address always
+        # Set only when empty; an existing value is the user's choice. Except user.email: any address
+        # other than a noreply one is replaced, so commits never expose a real address and pushes
+        # pass GitHub's "Block command line pushes that expose my email". The noreply address always
         # matches the account, so GitHub never refuses a commit for it.
         $noreply = "$($ghUser.id)+$($ghUser.login)@users.noreply.github.com"
         $name = if ($ghUser.name) { $ghUser.name } else { $ghUser.login }
         foreach ($setting in @(
                 @{ Key = 'user.name'; Want = $name },
-                @{ Key = 'user.email'; Want = $noreply },
+                @{ Key = 'user.email'; Want = $noreply; Keep = '@users\.noreply\.github\.com$' },
                 @{ Key = 'init.defaultBranch'; Want = 'main' })) {
             $have = "$(& $git config --global --get $setting.Key 2>$null)".Trim()
-            if ($have) { Say OK "git $($setting.Key) is $have." }
-            elseif ($Check) { Say TODO "git $($setting.Key) is not set." }
+            if ($have -and (-not $setting.Keep -or $have -match $setting.Keep)) { Say OK "git $($setting.Key) is $have." }
+            elseif ($Check) { Say TODO $(if ($have) { "git $($setting.Key) is $have, not the GitHub noreply address." } else { "git $($setting.Key) is not set." }) }
             else {
                 & $git config --global $setting.Key $setting.Want
                 if ($LASTEXITCODE -eq 0) { Say FIXED "Set git $($setting.Key) to $($setting.Want)." } else { Say FAIL "Could not set git $($setting.Key)." }
